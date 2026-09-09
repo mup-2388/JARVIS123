@@ -134,6 +134,13 @@ CONFIRM_WORDS = {"yes", "confirm", "do it", "go ahead", "affirmative", "sure", "
 DENY_WORDS = {"no", "cancel", "never mind", "abort", "negative"}
 
 
+_DICTATE_LEAD = re.compile(
+    r"^(?:note|write|jot|take|remember)\b(?:\s+(?:that|down|it|this|these|the following|for me))*\s*[:,]?\s*",
+    re.I,
+)
+"""Strip ``note that``/``write down that``-style leads without eating the dictation itself."""
+
+
 def split_clauses(text: str) -> List[str]:
     """Split a compound utterance on conjunctions so one breath = several actions."""
     parts = [p.strip(" ,.") for p in re.split(r"\s+(?:and|then|also|plus|after that)\s+", text or "", flags=re.I)]
@@ -405,12 +412,12 @@ def _rule_open(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
                 unparsed.append(rest_low)
         elif re.search(r"\b(screenshot|screen ?shot)\b", rest_low):
             calls.append(("take_screenshot", {}))
-        elif re.search(r"^(?:note|write|jot|remember)\b\s*(?:that|down)\b", rest_low):
+        elif _DICTATE_LEAD.match(rest_low):
             # "...and note that X" is dictation, not a lookup. Keep the user's
-            # original casing in the body: "FC 26" must not become "fc 26".
-            body = re.sub(r"^(?:note|write|jot|remember)\s+(?:that|down)\s*[:,]*", "", rest, flags=re.I).strip(" ?.")
+            # original casing: "FC 26" must not become "fc 26".
+            body = _DICTATE_LEAD.sub("", rest, count=1).strip(" ?.")
             if body:
-                calls.append(("write_note", {"topic": " ".join(body.split()[:5]).capitalize()[:60],
+                calls.append(("write_note", {"topic": " ".join(body.split()[:5])[:60],
                                              "content": body[:900], "tags": "voice-memo"}))
             else:
                 unparsed.append(rest_low)
@@ -488,10 +495,10 @@ def _rule_note_read(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
     unparsed: List[str] = []
     for tail in tails:
         low = tail.lower().strip(" ,.")
-        if re.search(r"^(?:note|write|jot|remember)\s+(?:that|down)\b", low):
-            body = re.sub(r"^(?:note|write|jot|remember)\s+(?:that|down)\s*[:,]*", "", tail, flags=re.I).strip(" ?.")
+        if _DICTATE_LEAD.match(low):
+            body = _DICTATE_LEAD.sub("", tail, count=1).strip(" ?.")
             if body:
-                calls.append(("write_note", {"topic": " ".join(body.split()[:5]).capitalize()[:60],
+                calls.append(("write_note", {"topic": " ".join(body.split()[:5])[:60],
                                              "content": body[:900], "tags": "voice-memo"}))
             else:
                 unparsed.append(low)
