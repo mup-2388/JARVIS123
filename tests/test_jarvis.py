@@ -114,6 +114,13 @@ class TestInstantTrack(unittest.TestCase):
         self.assertEqual(names[:2], ["read_notes", "system_report"])
         self.assertEqual(plan["calls"][0]["arguments"]["topic"], "german dative")
 
+    def test_dictation_tail_preserves_casing(self):
+        plan = server.match_instant("open eden and note that FC 26 needs firmware 18.1.0")
+        write = [c for c in plan["calls"] if c["tool"] == "write_note"]
+        self.assertEqual(len(write), 1, "the trailing clause must be captured as a note, not a lookup")
+        self.assertIn("FC 26", write[0]["arguments"]["content"])
+        self.assertIn("18.1.0", write[0]["arguments"]["content"])
+
     def test_unparsed_clause_is_reported_not_guessed(self):
         plan = server.match_instant("open steam and sing the national anthem loudly")
         self.assertEqual([c["tool"] for c in plan["calls"]], ["launch_app"])

@@ -405,6 +405,15 @@ def _rule_open(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
                 unparsed.append(rest_low)
         elif re.search(r"\b(screenshot|screen ?shot)\b", rest_low):
             calls.append(("take_screenshot", {}))
+        elif re.search(r"^(?:note|write|jot|remember)\b\s*(?:that|down)\b", rest_low):
+            # "...and note that X" is dictation, not a lookup. Keep the user's
+            # original casing in the body: "FC 26" must not become "fc 26".
+            body = re.sub(r"^(?:note|write|jot|remember)\s+(?:that|down)\s*[:,]*", "", rest, flags=re.I).strip(" ?.")
+            if body:
+                calls.append(("write_note", {"topic": " ".join(body.split()[:5]).capitalize()[:60],
+                                             "content": body[:900], "tags": "voice-memo"}))
+            else:
+                unparsed.append(rest_low)
         elif re.search(r"\bnotes?\b", rest_low):
             topic = re.sub(r".*\bnotes?(?: about| on| for)?\b", "", rest_low, flags=re.I).strip(" ?.") or rest_low
             calls.append(("read_notes", {"topic": topic[:60], "limit": 1}))
@@ -476,23 +485,40 @@ def _rule_note_read(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
     clauses = split_clauses(topic)
     head, tails = (clauses[0], clauses[1:]) if clauses else (topic, [])
     calls: List[Tuple[str, Dict[str, Any]]] = [("read_notes", {"topic": head[:60], "limit": 2})]
+    unparsed: List[str] = []
     for tail in tails:
-        low = tail.lower()
-        if re.search(r"\b(cpu|ram|gpu|memory|disk|vram|battery|status|load|usage|telemetry)\b", low):
+        low = tail.lower().strip(" ,.")
+        if re.search(r"^(?:note|write|jot|remember)\s+(?:that|down)\b", low):
+            body = re.sub(r"^(?:note|write|jot|remember)\s+(?:that|down)\s*[:,]*", "", tail, flags=re.I).strip(" ?.")
+            if body:
+                calls.append(("write_note", {"topic": " ".join(body.split()[:5]).capitalize()[:60],
+                                             "content": body[:900], "tags": "voice-memo"}))
+            else:
+                unparsed.append(low)
+        elif re.search(r"\b(cpu|ram|gpu|memory|disk|vram|battery|status|load|usage|telemetry|temp|temperature)\b", low):
             calls.append(("system_report", {"detailed": True}))
         elif re.search(r"\b(time|clock|date)\b", low):
             calls.append(("get_time", {}))
         elif re.search(r"\b(screenshot|screen ?shot)\b", low):
             calls.append(("take_screenshot", {}))
-        elif re.search(r"\b(search|google|look up|find)\b", low):
-            query = re.sub(r"^.*?\b(?:search|google|look up|find)\b\s+(?:for\s+)?", "", tail, flags=re.I).strip(" ?.")
+        elif re.search(r"\b(search|google|look up|find out|find)\b", low):
+            query = re.sub(r"^.*?\b(?:search|google|look up|find out|find)\b\s+(?:for\s+)?", "", tail, flags=re.I).strip(" ?.")
             if query:
                 calls.append(("web_search", {"query": query, "max_results": 5, "timelimit": "", "site": ""}))
+            else:
+                unparsed.append(low)
         elif re.search(r"\bnotes?\b", low):
-            calls.append(("read_notes", {"topic": re.sub(r".*\bnotes?\b", "", low)[:60] or low[:60], "limit": 1}))
+            extra = re.sub(r".*\bnotes?\b(?: about| on| for)?", "", low, flags=re.I).strip(" ?.")
+            calls.append(("read_notes", {"topic": (extra or low)[:60], "limit": 1}))
         else:
-            calls.append(("read_notes", {"topic": tail[:60], "limit": 1}))
-    return _calls(*calls)
+            # Never invent an action for a clause we cannot parse.
+            unparsed.append(low)
+    plan = _calls(*calls)
+    if unparsed:
+        plan["answer_prefix"] = (f'I looked up "{head}" as asked, but I could not map '
+                                 f'"{chr(34).join(unparsed[:2])}" — ask me that on its own.')
+        plan["unparsed"] = unparsed
+    return plan
 
 
 def _rule_note_write(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
