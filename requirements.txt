@@ -1,0 +1,36 @@
+# ============================================================================
+#  PROJECT J.A.R.V.I.S. -- runtime dependencies
+#  Target platform: Windows 10/11, NVIDIA RTX 3050 4GB (CUDA 12.x)
+#  Install:  python -m venv .venv
+#            .venv\Scripts\activate
+#            pip install -r requirements.txt
+#
+#  Optional system-level tooling (not pip-installable):
+#    - ffmpeg          -> required to decode browser mic audio (webm/opus)
+#    - CUDA 12 + cuDNN -> required for GPU STT/TTS (falls back to CPU)
+# ============================================================================
+
+# --- Web core / HUD backend -------------------------------------------------
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29
+websockets>=12.0
+pywebview>=5.1
+
+# --- LLM brain (Track 2, agentic) ------------------------------------------
+huggingface-hub[inference]>=0.23
+
+# --- Live tools -------------------------------------------------------------
+# NOTE: upstream renamed the package to `ddgs` (same API, new name). tools.py
+# imports `ddgs` first and falls back to `duckduckgo_search`, so either works.
+duckduckgo-search>=6.1
+requests>=2.31
+
+# --- Voice engine -----------------------------------------------------------
+faster-whisper>=1.0.0
+TTS>=0.22.0
+
+# --- OS automation / telemetry ---------------------------------------------
+psutil>=5.9
+
+# --- Discord bridge ---------------------------------------------------------
+discord.py>=2.4
