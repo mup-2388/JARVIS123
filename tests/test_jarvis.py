@@ -454,11 +454,117 @@ class TestHttpApi(unittest.TestCase):
             handle.setsampwidth(2)
             handle.setframerate(16000)
             handle.writeframes(frames)
+        import base64
+
         response = self.client.post(
-            "/api/transcribe", files={"file": ("clip.wav", buffer.getvalue(), "audio/wav")}, data={"speak": "false"}
+            "/api/transcribe",
+            json={"audio_base64": base64.b64encode(buffer.getvalue()).decode(), "format": "wav", "speak": False},
         )
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["ok"])
+
+
+class TestTranscribeEndpoint(unittest.TestCase):
+    """The audio-in route must not require FastAPI's optional multipart extra."""
+
+    def test_server_module_has_no_multipart_params(self):
+        source = (config.ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertNotIn("UploadFile", source)
+        self.assertNotIn("File(...)", source)
+        self.assertNotIn("Form(", source)
+        self.assertIn("python-multipart", source, "the reason for JSON-only uploads should be documented")
+
+    def test_bad_base64_reports_instead_of_crashing(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(server.create_app())
+        response = client.post("/api/transcribe", json={"audio_base64": "!!not base64!!"})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("base64", body["error"])
+        missing = client.post("/api/transcribe", json={}).json()
+        self.assertFalse(missing["ok"])
+        self.assertIn("audio_base64", missing["error"])
+
+
+class TestWindowBootstrap(unittest.TestCase):
+    """pywebview's load event is an object subscribed to with ``+=``, not a decorator."""
+
+    class Event:
+        def __init__(self) -> None:
+            self.handlers: list = []
+
+        def __iadd__(self, handler):
+            self.handlers.append(handler)
+            return self
+
+        def fire(self) -> int:
+            for handler in self.handlers:
+                handler()
+            return len(self.handlers)
+
+    class ModernWindow:
+        def __init__(self) -> None:
+            self.events = type("E", (), {"loaded": TestWindowBootstrap.Event()})()
+
+    class LegacyWindow:
+        def __init__(self) -> None:
+            self.loaded = TestWindowBootstrap.Event()
+
+    class DeadWindow:
+        pass
+
+    def setUp(self) -> None:
+        import main
+        self.main = main
+
+    def test_modern_event_object_is_used(self):
+        window, called = self.ModernWindow(), []
+        label = self.main.attach_loaded_handler(window, lambda: called.append(1))
+        self.assertEqual(label, "window.events.loaded")
+        self.assertEqual(window.events.loaded.fire(), 1)
+        self.assertEqual(called, [1])
+
+    def test_legacy_event_object_is_used(self):
+        window, called = self.LegacyWindow(), []
+        label = self.main.attach_loaded_handler(window, lambda: called.append(1))
+        self.assertEqual(label, "window.loaded")
+        self.assertEqual(window.loaded.fire(), 1, "the handler must be registered on the event")
+        self.assertEqual(called, [1])
+
+    def test_no_event_object_reports_empty_so_start_falls_back(self):
+        self.assertEqual(self.main.attach_loaded_handler(self.DeadWindow(), lambda: None), "")
+
+    def test_broken_iadd_does_not_raise(self):
+        window = type("W", (), {"events": type("E", (), {"loaded": object()})()})()
+        self.assertEqual(self.main.attach_loaded_handler(window, lambda: None), "")
+
+    @unittest.skipUnless(__import__("importlib").util.find_spec("webview"), "pywebview not installed")
+    def test_real_pywebview_event_object_is_subscribed(self):
+        """Against the actual library: ``+=`` works, the decorator form raises."""
+        from webview.event import Event
+
+        class Emitter:
+            def __init__(self) -> None:
+                self.loaded = Event(None)
+
+        class RealWindow:
+            def __init__(self) -> None:
+                self.events = Emitter()
+
+        window, ran = RealWindow(), []
+        self.assertEqual(self.main.attach_loaded_handler(window, lambda: ran.append(1)), "window.events.loaded")
+        window.events.loaded.set()
+        self.assertEqual(ran, [1])
+        with self.assertRaises(TypeError):
+            @window.events.loaded
+            def _decorator_attempt() -> None: ...
+
+    def test_main_py_never_uses_the_event_as_a_decorator(self):
+        source = (config.ROOT / "main.py").read_text(encoding="utf-8")
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("@window.events", code, "the load event must be subscribed with +=, never used as a decorator")
+        self.assertIn("attach_loaded_handler(window, on_loaded)", source)
 
 
 if __name__ == "__main__":

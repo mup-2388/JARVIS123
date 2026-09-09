@@ -100,7 +100,7 @@ into the channel.
 GET  /                      HUD                POST /api/command      {"text","speak","agent"}
 GET  /healthz               liveness           POST /api/speak        {"text","play"}
 GET  /api/status            mode/voice/router  POST /api/stop         kill TTS queue
-GET  /api/telemetry         one snapshot       POST /api/transcribe   multipart audio -> STT
+GET  /api/telemetry         one snapshot       POST /api/transcribe   {audio_base64} -> STT
 GET  /api/config            resolved config    POST /api/listen       raw mic bytes
 GET  /api/history           turns + cards      POST /api/discord/mirror {"on":true}
 GET  /api/notes?topic=german                    GET  /api/search?q=...

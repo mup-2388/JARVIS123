@@ -324,6 +324,37 @@ def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
     print()
 
 
+def attach_loaded_handler(window: object, handler) -> str:  # noqa: ANN001
+    """Subscribe ``handler`` to the window's load event; report the mechanism used.
+
+    pywebview's API moved around between major versions and the event object is
+    *not* a decorator:
+
+    * 4.x/5.x -> ``window.events.loaded += handler``
+    * 3.x/2.x -> ``window.loaded += handler``
+
+    ``+=`` on those objects calls ``Event.__iadd__``, which appends the callback and
+    returns the same event, so the mutation lands on the window either way.
+    Returns an empty string when no event object could be found; the caller then
+    passes the handler to ``webview.start()`` as a one-shot start callback.
+    """
+    for label, holder in (("window.events.loaded", getattr(window, "events", None)), ("window.loaded", window)):
+        event = getattr(holder, "loaded", None) if holder is not None else None
+        if event is None:
+            continue
+        iadd = getattr(event, "__iadd__", None)
+        if iadd is None:
+            continue
+        try:
+            iadd(handler)
+        except TypeError as exc:
+            log.debug("%s rejected the load handler (%s)", label, exc)
+            continue
+        log.debug("HUD load event subscribed via %s", label)
+        return label
+    return ""
+
+
 def launch(args: argparse.Namespace) -> int:
     print(BANNER)
     report = preflight()
@@ -399,7 +430,6 @@ def launch(args: argparse.Namespace) -> int:
     )
     bridge.window = window
 
-    @window.events.loaded
     def on_loaded() -> None:  # noqa: ANN001 - pywebview passes no args
         """Tell the file://-loaded HUD where its WebSocket lives, then decorate it."""
         payload = {
@@ -420,9 +450,19 @@ def launch(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 - older pywebview versions
             log.debug("evaluate_js failed: %s", exc)
 
+    #: ``window.events.loaded`` is an Event *object*, so subscribing means ``+=``;
+    #: decorating with it calls the event and raises "TypeError: 'Event' object is
+    #: not callable" - which is exactly what :func:`attach_loaded_handler` avoids.
+    subscribed = attach_loaded_handler(window, on_loaded)
+
     try:
-        # Starts the native window loop (blocks until the window closes).
-        webview.start(debug=bool(args.devtools))
+        # Starts the native window loop (blocks until the window closes).  With no
+        # load event available we pass the bootstrap as the start callback instead.
+        if subscribed:
+            webview.start(debug=bool(args.devtools))
+        else:
+            log.warning("no pywebview load event; bootstrapping the HUD from webview.start()")
+            webview.start(on_loaded, (), debug=bool(args.devtools))
     except KeyboardInterrupt:
         pass
     except Exception as exc:  # noqa: BLE001

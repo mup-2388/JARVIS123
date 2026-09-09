@@ -50,7 +50,7 @@ import tools
 from audio_engine import ENGINE as voice
 from audio_engine import TARGET_SR
 from config import SETTINGS, get_logger
-from fastapi import Body, FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -1027,12 +1027,29 @@ def create_app() -> FastAPI:
         return await _process_audio(body, ext, source="rest-mic")
 
     @app.post("/api/transcribe")
-    async def post_transcribe(file: UploadFile = File(...), speak: bool = Form(False), command: bool = Form(True)) -> Dict[str, Any]:  # noqa: B008
-        payload = await file.read()
-        ext = (Path(file.filename or "audio.webm").suffix or ".webm").lstrip(".") or "webm"
+    async def post_transcribe(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
+        """``{"audio_base64": "...", "format": "wav", "speak": false, "command": true}``.
+
+        Deliberately JSON rather than a multipart upload: FastAPI only allows
+        ``File``/``Form`` parameters when the optional ``python-multipart`` package is
+        installed, and importing this module would then fail at start-up.  JSON keeps
+        the dependency list to the ten pinned packages.  Raw bytes still work via
+        ``POST /api/listen``.
+        """
+        encoded = str(payload.get("audio_base64") or payload.get("audio") or "").strip()
+        if not encoded:
+            return {"ok": False, "error": 'send {"audio_base64": "<base64 of a wav/webm/pcm clip>"} (or POST raw bytes to /api/listen)'}
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            return {"ok": False, "error": f"audio_base64 is not valid base64: {exc}"}
+        speak = bool(payload.get("speak", False))
+        command = payload.get("command", True)
+        ext = str(payload.get("format") or payload.get("filename") or "webm")
+        ext = Path(ext).suffix.lstrip(".") if Path(ext).suffix else ext
         if ext not in {"wav", "webm", "ogg", "opus", "m4a", "mp3", "aac", "pcm"}:
             ext = "webm"
-        transcript = await asyncio.to_thread(voice.listen, payload, ext)
+        transcript = await asyncio.to_thread(voice.listen, raw, ext)
         result: Dict[str, Any] = {"ok": bool(transcript.text), "transcript": transcript.as_dict()}
         if not transcript.text:
             result["error"] = transcript.engine if transcript.engine.startswith(("decode-error", "error")) else "no speech detected"
