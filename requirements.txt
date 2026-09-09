@@ -22,8 +22,8 @@ huggingface-hub[inference]>=0.23
 # --- Live tools -------------------------------------------------------------
 # NOTE: upstream renamed the package to `ddgs` (same API, new name). tools.py
 # imports `ddgs` first and falls back to `duckduckgo_search`, so either works.
+# Sports/HTTP calls use stdlib urllib, so no `requests` pin is needed.
 duckduckgo-search>=6.1
-requests>=2.31
 
 # --- Voice engine -----------------------------------------------------------
 faster-whisper>=1.0.0
