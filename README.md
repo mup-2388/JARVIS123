@@ -116,7 +116,7 @@ Outbound: `hello`, `telemetry`, `log`, `state`, `reply`, `card`, `transcript`, `
 ## 6 · Verification
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe -m unittest discover -s tests -v     # 67 cases, all offline
 .venv\Scripts\python.exe -c "import router,json;print(json.dumps(router.TOOL_SCHEMAS[0],indent=2))"
 curl http://127.0.0.1:8760/api/telemetry
 ```
@@ -130,6 +130,9 @@ curl http://127.0.0.1:8760/api/telemetry
 | XTTS never loads | reference wav missing/short, or the Coqui model is not downloaded yet (first run pulls ~2 GB) |
 | `CUDA out of memory` | `WHISPER_MODEL=tiny`, or `TTS_DEVICE=cpu` |
 | Tool says it cannot find the app | add `CUSTOM_APPS=Eden=D:\Emulators\Eden\eden.exe` to `.env` |
+| Window opens, then **Not responding**, log ends with `Error while processing window.native.AccessibilityObject…: maximum recursion depth exceeded` | pywebview builds the JS API by recursively walking every public attribute of the `js_api` object, so the native `Window` must never be reachable from it. `JarvisBridge` therefore exposes *methods only* and keeps the window on `self._window` (leading underscore = skipped). If you add bridge methods, do not add public attributes |
+| `TypeError: 'Event' object is not callable` right after the window is created | the load event is an object you subscribe to with `+=`, not a decorator - `attach_loaded_handler()` handles both pywebview layouts and falls back to `webview.start(func, args)` |
+| Quit/menu does nothing | window controls are capability-checked (`destroy` in 5.x, `close` in older builds); the bridge reports `supports none of …` instead of throwing |
 | Discord bot reads nothing | *Message Content Intent* is off in the developer portal |
 | Sports returns 429 | free tier = 10 req/min; the tool reports the `Retry-After` |
 | Volume/power did nothing | PowerShell blocked: run `powershell -Command "Get-ExecutionPolicy"`; allow `RemoteSigned` for the user |

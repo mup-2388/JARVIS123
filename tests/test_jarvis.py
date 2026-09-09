@@ -487,6 +487,95 @@ class TestTranscribeEndpoint(unittest.TestCase):
         self.assertIn("audio_base64", missing["error"])
 
 
+class TestJsApiSurface(unittest.TestCase):
+    """pywebview recursively walks every public attribute of the js_api object."""
+
+    class Endless:
+        """Mimics pythonnet's Rectangle.Empty -> .Empty -> .Empty chain.
+
+        ``Empty`` is a real property (as it is on the .NET struct) so ``dir()``
+        exposes it and the recursive walk keeps descending.
+        """
+
+        @property
+        def Empty(self):  # noqa: N802 - mirroring the .NET member name
+            return TestJsApiSurface.Endless()
+
+    @staticmethod
+    def _walk(obj, base_name="", seen=None, found=None):
+        """A copy of webview.util.get_functions' traversal rules."""
+        import inspect
+
+        seen = [] if seen is None else seen
+        found = {} if found is None else found
+        if id(obj) in seen:
+            return found
+        seen.append(id(obj))
+        for name in dir(obj):
+            full = f"{base_name}.{name}" if base_name else name
+            if name.startswith("_"):
+                continue
+            attr = getattr(obj, name)
+            if not getattr(attr, "_serializable", True):
+                continue
+            if inspect.ismethod(attr) or inspect.isfunction(attr):
+                found[full] = "method"
+            elif inspect.isclass(attr) or (
+                isinstance(attr, object) and not callable(attr) and hasattr(attr, "__module__")
+            ):
+                TestJsApiSurface._walk(attr, full, seen, found)
+        return found
+
+    def setUp(self) -> None:
+        import main
+        self.main = main
+
+    def test_bridge_public_surface_is_only_methods(self):
+        bridge = self.main.JarvisBridge(8760, window=self.Endless())
+        public = [name for name in dir(bridge) if not name.startswith("_")]
+        self.assertTrue(public)
+        for name in public:
+            self.assertTrue(callable(getattr(bridge, name)), f"{name} must be callable or pywebview will recurse into it")
+        self.assertNotIn("window", public)
+        self.assertNotIn("port", public)
+
+    def test_pywebview_walk_terminates_on_the_bridge(self):
+        bridge = self.main.JarvisBridge(8760, window=self.Endless())
+        found = self._walk(bridge)
+        self.assertEqual(set(found.values()), {"method"})
+        self.assertIn("command", found)
+
+    def test_an_exposed_window_object_would_infinite_recurse(self):
+        """Negative control: the bug this class guards against is real."""
+        class BadBridge:
+            def __init__(self, window):
+                self.window = window      # exactly what main.py used to do
+
+        with self.assertRaises(RecursionError):
+            self._walk(BadBridge(self.Endless()))
+
+    def test_destroy_is_preferred_over_the_missing_close(self):
+        calls = []
+        window = type("W", (), {"destroy": lambda self: calls.append("destroy")})()
+        bridge = self.main.JarvisBridge(8760, window=window)
+        bridge._shutdown()
+        self.assertEqual(calls, ["destroy"], "pywebview 5.x Window has destroy(), not close()")
+
+    def test_unsupported_control_reports_instead_of_raising(self):
+        bridge = self.main.JarvisBridge(8760, window=type("W", (), {})())
+        result = bridge.toggle_frameless()
+        self.assertFalse(result["ok"])
+        self.assertIn("supports none of", result["error"])
+        self.assertFalse(bridge.minimize()["ok"])
+        bridge_no_window = self.main.JarvisBridge(8760)
+        self.assertIn("no window", bridge_no_window.maximize()["error"])
+
+    def test_set_topmost_survives_a_backend_without_the_property(self):
+        bridge = self.main.JarvisBridge(8760, window=object())   # plain object: no on_top setter
+        result = bridge.set_topmost(True)
+        self.assertIsInstance(result["ok"], bool)                 # reported, never raised
+
+
 class TestWindowBootstrap(unittest.TestCase):
     """pywebview's load event is an object subscribed to with ``+=``, not a decorator."""
 

@@ -39,7 +39,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # sys.path[0] is already this folder when run as `python main.py`, but a
 # scheduled task / .bat with a different CWD can break absolute imports of the
@@ -214,15 +214,28 @@ class JarvisBridge:
     These call the HTTP API on our own port instead of importing the loop: the
     window thread must never block on model work, and going through REST keeps
     one single code path for HUD, Discord and curl.
+
+    **Exposure rule (this bit caused a hard freeze on Windows).**  pywebview
+    generates the JavaScript API by walking ``dir()`` of this object and
+    *recursing into every non-callable attribute* (``webview.util.get_functions``).
+    Holding the native window on it - ``self.window = window`` - sends that walk
+    into ``window.native`` (a WinForms control), whose ``AccessibilityObject`` →
+    ``Bounds`` → ``Empty`` → ``Empty`` chain never terminates, so boot died with
+    "maximum recursion depth exceeded" while the UI thread was stuck reflecting
+    pythonnet objects and the window never repainted.  So: public surface is
+    plain methods with JSON-friendly arguments only; state lives on
+    ``_``-prefixed attributes, which pywebview skips, and never on GUI objects.
     """
 
     def __init__(self, port: int, window: Any = None) -> None:
-        self.port = port
-        self.window = window
+        self._port = int(port)
+        self._window: Any = window          # private: pywebview must not walk it
+
+    # Nothing below may gain a public non-callable attribute: see class docstring.
 
     # -- plumbing ----------------------------------------------------------
     def _request(self, path: str, payload: Optional[Dict[str, Any]] = None, timeout: float = 120.0) -> Dict[str, Any]:
-        url = f"http://127.0.0.1:{self.port}{path}"
+        url = f"http://127.0.0.1:{self._port}{path}"
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         request = urllib.request.Request(
             url, data=data, headers={"content-type": "application/json"}, method="POST" if data else "GET"
@@ -260,44 +273,54 @@ class JarvisBridge:
         return self._request("/api/discord/mirror", {"on": bool(on)})
 
     # -- window controls ---------------------------------------------------
+    # -- window controls ---------------------------------------------------
+    def _window_call(self, names: Tuple[str, ...], *args: Any) -> Dict[str, Any]:
+        """Call the first window method this pywebview build actually has.
+
+        pywebview renames and drops things between releases (5.x has ``destroy``
+        but no ``close``, and removed ``toggle_frameless``), so each control is
+        capability-checked: an unavailable one is reported plainly instead of
+        raising an AttributeError through the JavaScript bridge.
+        """
+        if self._window is None:
+            return {"ok": False, "error": "no window bound (running headless?)"}
+        for name in names:
+            attr = getattr(self._window, name, None)
+            if attr is None:
+                continue
+            try:
+                value = attr(*args) if callable(attr) else attr
+            except Exception as exc:  # noqa: BLE001 - platform dependent
+                return {"ok": False, "error": f"{name}() failed: {exc}"}
+            return {"ok": True, "method": name, "result": value}
+        return {"ok": False, "error": "this pywebview build supports none of: " + ", ".join(names)}
+
     def set_topmost(self, on: bool = True) -> Dict[str, Any]:
-        if self.window is None:
-            return {"ok": False, "error": "no window"}
-        self.window.on_top = bool(on)
-        return {"ok": True, "on_top": bool(self.window.on_top)}
+        if self._window is None:
+            return {"ok": False, "error": "no window bound (running headless?)"}
+        try:
+            self._window.on_top = bool(on)
+        except Exception as exc:  # noqa: BLE001 - not every GUI backend has the property
+            return {"ok": False, "error": f"on_top unsupported here: {exc}"}
+        return {"ok": True, "on_top": bool(getattr(self._window, "on_top", on))}
 
     def toggle_frameless(self) -> Dict[str, Any]:
-        if self.window is None:
-            return {"ok": False, "error": "no window"}
-        try:
-            self.window.toggle_frameless()
-            return {"ok": True}
-        except Exception as exc:  # noqa: BLE001 - platform dependent
-            return {"ok": False, "error": str(exc)}
+        return self._window_call(("toggle_frameless", "set_frameless"))
 
     def minimize(self) -> Dict[str, Any]:
-        if self.window is None:
-            return {"ok": False}
-        self.window.minimize()
-        return {"ok": True}
+        return self._window_call(("minimize",))
 
     def maximize(self) -> Dict[str, Any]:
-        if self.window is None:
-            return {"ok": False}
-        self.window.maximize()
-        return {"ok": True}
+        return self._window_call(("maximize",))
 
     def quit(self) -> Dict[str, Any]:
         threading.Thread(target=self._shutdown, daemon=True).start()
         return {"ok": True}
 
     def _shutdown(self) -> None:
-        try:
-            if self.window is not None:
-                self.window.close()
-        except Exception:  # noqa: BLE001
-            pass
-
+        """Close the window so ``webview.start()`` returns and the process exits."""
+        if self._window is not None:
+            self._window_call(("destroy", "close"))
 
 # ---------------------------------------------------------------------------
 # Launch
@@ -428,7 +451,9 @@ def launch(args: argparse.Namespace) -> int:
         text_select=True,
         js_api=bridge,
     )
-    bridge.window = window
+    #: private on purpose: pywebview exposes every public attribute it can walk,
+    #: so the native window must never be reachable from the JS surface.
+    bridge._window = window
 
     def on_loaded() -> None:  # noqa: ANN001 - pywebview passes no args
         """Tell the file://-loaded HUD where its WebSocket lives, then decorate it."""
@@ -439,14 +464,17 @@ def launch(args: argparse.Namespace) -> int:
             "speak_replies": SETTINGS.speak_replies,
             "frameless": bool(args.frameless),
         }
+        script = (
+            f"window.JARVIS_BACKEND = {json.dumps(payload['backend'])};"
+            f"window.JARVIS_SOCKET = {json.dumps(payload['socket'])};"
+            f"window.JARVIS_BOOT = {json.dumps(payload)};"
+            "document.title='JARVIS';"
+            "document.documentElement.dataset.chrome = 'webview';"
+        )
         try:
-            window.evaluate_js(f"window.JARVIS_BACKEND = {json.dumps(payload['backend'])};")
-            window.evaluate_js(f"window.JARVIS_SOCKET = {json.dumps(payload['socket'])};")
-            window.evaluate_js(f"window.JARVIS_BOOT = {json.dumps(payload)};")
-            window.evaluate_js(
-                "document.title='JARVIS';"
-                "document.documentElement.dataset.chrome = 'webview';"
-            )
+            # One round-trip, not four: every evaluate_js waits on pywebview's
+            # ready/loaded events, so stacking them multiplies any stall.
+            window.evaluate_js(script)
         except Exception as exc:  # noqa: BLE001 - older pywebview versions
             log.debug("evaluate_js failed: %s", exc)
 
