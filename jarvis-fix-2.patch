@@ -1,0 +1,527 @@
+From b9b438dc1daf113d2e702957f82cca2975833b9c Mon Sep 17 00:00:00 2001
+From: mup-2388 <288946382+mup-2388@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 19:47:56 +0000
+Subject: [PATCH] Fix reasoning leak, invisible bar, and silent mic (batch 2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Chain-of-thought leak (the "answers with the thinking part" bug):
+- llm_providers.strip_reasoning() removes <think>/<thinking>/<reasoning>/… blocks
+  (contents included), drops a truncated mid-thought tail, and keeps only the
+  answer after Qwen3/DeepSeek-style <|endofthink|>/<|im_start|>assistant markers.
+- _parse() now runs every completion through it, and no longer falls back to the
+  message.reasoning/reasoning_content field (that is the CoT, never the answer).
+- router._clean_answer() applies the same scrub as a second line of defence.
+
+Floating bar never appears on screen (present in taskbar, invisible):
+- winops.work_area() reports the desktop minus the taskbar instead of the raw
+  screen size, which lands the bar under the taskbar or off-screen on a
+  DPI-scaled laptop.
+- main._bar_rect() positions from the work area; the bar controller now
+  re-applies geometry with the native HWND (winops.move_window) every time it is
+  shown, so it is pinned on-screen regardless of pywebview's DPI handling.
+
+Mic / wake-word not hearing anything:
+- The HUD now captures a raw 16 kHz PCM clip (ScriptProcessor) instead of a
+  webm/opus MediaRecorder clip, so transcription needs no ffmpeg install.
+- audio_engine.decode_to_wav() and /api/transcribe route "pcm" straight to
+  transcribe_pcm (no ffmpeg).
+- server._stt_problem() and wake._transcribe() surface the real reason an
+  utterance came back empty (whisper not loaded, decode failed) instead of the
+  misleading "no speech detected", so the terminal explains the silence.
+- requirements.txt adds sounddevice so the always-on ear can stream the mic.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ audio_engine.py       |  3 ++
+ llm_providers.py      | 77 +++++++++++++++++++++++++++++++++++++++--
+ main.py               | 51 +++++++++++++++++++--------
+ requirements.txt      |  6 ++++
+ router.py             |  5 +--
+ server.py             | 32 +++++++++++++++--
+ static/arc_reactor.js | 80 +++++++++++++++++++++++++++++++++++++++++++
+ wake.py               |  6 ++++
+ winops.py             | 24 +++++++++++++
+ 9 files changed, 262 insertions(+), 22 deletions(-)
+
+diff --git a/audio_engine.py b/audio_engine.py
+index 7c67929..be2d4b1 100644
+--- a/audio_engine.py
++++ b/audio_engine.py
+@@ -104,6 +104,9 @@ def decode_to_wav(payload: bytes, src_ext: str = "webm") -> Tuple[Optional[Path]
+     if not payload:
+         return None, "empty audio payload"
+     out = Path(tempfile.gettempdir()) / f"jarvis_in_{os.getpid()}_{threading.get_ident()}.wav"
++    if src_ext == "pcm":
++        # Raw 16 kHz s16 mono from the HUD/bar — no ffmpeg needed to wrap it.
++        return pcm16_to_wav(payload, TARGET_SR), ""
+     if src_ext in {"wav"} and payload[:4] == b"RIFF":
+         # Already PCM-ish; sniff-convert anyway so weird float formats normalise.
+         pass
+diff --git a/llm_providers.py b/llm_providers.py
+index 642caf0..4eecdff 100644
+--- a/llm_providers.py
++++ b/llm_providers.py
+@@ -661,6 +661,76 @@ def _quota_text(body: Any) -> str:
+     return str(body)[:200]
+ 
+ 
++# ---------------------------------------------------------------------------
++# Reasoning ("chain-of-thought") scrubber
++# ---------------------------------------------------------------------------
++#: Reasoning models wrap their inner monologue in tags so the assistant must
++#: never recite them.  Whitespace/newlines tolerated because some hubs break
++#: the tags across lines, and the names vary wildly between vendors.
++_THINK_OPEN = re.compile(
++    r"<\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>",
++    re.I,
++)
++_THINK_CLOSE = re.compile(
++    r"<\s*/\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>",
++    re.I,
++)
++_THINK_BLOCK = re.compile(
++    r"<\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>"
++    r".*?"
++    r"<\s*/\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>",
++    re.I | re.S,
++)
++#: Special tokens that mark the end of the CoT on Qwen3/DeepSeek-style models.
++#: Everything before these is thinking; everything after is the answer.
++_ANSWER_MARKERS = ("<|endofthink|>", "<|end_of_think|>", "<|end_of_thought|>",
++                   "<|begin_of_answer|>", "<|im_start|>assistant", "<|assistant|>")
++#: Tokens that carry no answer themselves and are just removed.
++_NOISE_TOKENS = ("<|im_start|>", "<|im_end|>", "<|startofthink|>", "<|start_of_think|>",
++                 "<|begin_of_thought|>", "<|end_of_thought|>")
++
++
++def strip_reasoning(text: str) -> str:
++    """Return ``text`` with any model chain-of-thought removed.
++
++    Fixes the "JARVIS keeps answering with the thinking part" bug: reasoning
++    models (Qwen3, DeepSeek-R1, Groq's ``*maverick/scout``, …) sometimes emit
++    their inner monologue inline as ``<think>…</think>`` or behind a special
++    ``<|endofthink|>`` token.  We drop the blocks and keep only the answer.
++    """
++    if not text:
++        return ""
++    s = str(text)
++
++    # 1. Remove complete ``<think>…</think>`` blocks, contents included.
++    s = _THINK_BLOCK.sub("", s)
++
++    # 2. A leftover OPEN tag means the model was cut off mid-thought (e.g. it hit
++    #    max_tokens while reasoning): keep only what precedes it, never the CoT.
++    s = _THINK_OPEN.split(s, 1)[0]
++
++    # 3. Drop stray closing tags.
++    s = _THINK_CLOSE.sub("", s)
++
++    # 4. If a marker separated reasoning from the answer, keep the answer tail
++    #    (before step 5 strips the markers themselves).
++    best = -1
++    for marker in _ANSWER_MARKERS:
++        idx = s.rfind(marker)
++        if idx > best:
++            best = idx
++            best_len = len(marker)
++    if best >= 0:
++        s = s[best + best_len:]
++
++    # 5. Drop chat-template noise tokens that carry no answer.
++    for token in _NOISE_TOKENS:
++        s = s.replace(token, "")
++
++    # 6. Collapse whitespace runs left behind by the removals.
++    return re.sub(r"\s+", " ", s).strip()
++
++
+ # ---------------------------------------------------------------------------
+ # The pool
+ # ---------------------------------------------------------------------------
+@@ -1111,8 +1181,9 @@ class LlmPool:
+             choice = body["choices"][0] or {}
+             message = choice.get("message") or {}
+             content = str(message.get("content") or "")
+-            if not content and isinstance(message.get("reasoning"), str):
+-                content = message["reasoning"]
++            # ``reasoning`` / ``reasoning_content`` is the model's chain-of-thought,
++            # never the answer — reciting it is the "answers with the thinking part"
++            # bug, so it is deliberately ignored even when ``content`` is empty.
+             calls = _native_tool_calls(message.get("tool_calls"))
+             if not calls:
+                 for tc in message.get("tool_calls") or []:      # openrouter/mistral variants
+@@ -1124,7 +1195,7 @@ class LlmPool:
+             raise ValueError(f"unrecognised response shape: {str(body)[:180]}")
+         usage = body.get("usage") if isinstance(body, dict) else None
+         return {
+-            "content": content.strip(),
++            "content": strip_reasoning(content),
+             "tool_calls": calls,
+             "provider": spec.key,
+             "model": model,
+diff --git a/main.py b/main.py
+index d0bb7e7..86047c1 100644
+--- a/main.py
++++ b/main.py
+@@ -453,17 +453,26 @@ def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
+     print()
+ 
+ 
+-def _bar_top() -> int:
+-    """Y-position for the floating bar: bottom-left of the primary screen, above the taskbar."""
++def _bar_rect() -> Tuple[int, int, int, int]:
++    """``(x, y, width, height)`` for the floating bar, bottom-left of the *work area*.
++
++    Uses the taskbar-excluding work area (via ``winops.work_area()``) rather than the
++    raw screen size, and clamps to sane bounds so the bar can never be created off-screen
++    on a DPI-scaled laptop (the classic "F12 shows it in the taskbar but I can't see it" bug).
++    """
++    width = max(360, int(SETTINGS.bar_width))
++    height = max(64, int(SETTINGS.bar_height))
++    x, y = 48, 640
+     try:
+         import winops
+ 
+-        size = winops.screen_size()
+-        if len(size) > 1 and size[1]:
+-            return max(0, int(size[1]) - SETTINGS.bar_height - 96)
++        area = winops.work_area()
++        if len(area) >= 4 and area[2] > 0 and area[3] > 0:
++            x = int(area[0]) + 48
++            y = max(int(area[1]), int(area[1]) + int(area[3]) - height - 96)
+     except Exception:  # noqa: BLE001 - no display info is no reason to fail
+         pass
+-    return 640
++    return x, y, width, height
+ 
+ 
+ def attach_loaded_handler(window: object, handler) -> str:  # noqa: ANN001
+@@ -580,10 +589,11 @@ def launch(args: argparse.Namespace) -> int:
+     bar = None
+     if SETTINGS.bar_enabled:
+         bar_url = f"http://127.0.0.1:{port}/bar"
++        bar_x, bar_y, bar_w, bar_h = _bar_rect()
+         try:
+             bar = webview.create_window(
+-                "JARVIS bar", bar_url, width=max(360, SETTINGS.bar_width), height=max(64, SETTINGS.bar_height),
+-                x=48, y=_bar_top(), easy_drag=True,
++                "JARVIS bar", bar_url, width=bar_w, height=bar_h,
++                x=bar_x, y=bar_y, easy_drag=True,
+                 frameless=True, on_top=True, resizable=False, hidden=True, background_color="#05080e",
+             )
+         except TypeError:
+@@ -610,18 +620,30 @@ def launch(args: argparse.Namespace) -> int:
+                 bar.hide()
+                 bar_controller.visible = False
+             elif action == "toggle":
+-                (bar.hide() if visible else bar.show())
+-                bar_controller.visible = not visible
++                if visible:
++                    bar.hide()
++                    bar_controller.visible = False
++                else:
++                    bar.show()
++                    bar_controller.visible = True
++                    _place_overlay(bar)
+             else:
+                 bar.show()
+                 bar_controller.visible = True
+-                _style_overlay(bar)
++                _place_overlay(bar)
+         except Exception as exc:  # noqa: BLE001 - a stuck overlay must not kill the app
+             return {"ok": False, "visible": visible, "message": str(exc)}
+         return {"ok": True, "visible": bool(bar_controller.visible)}
+ 
+-    def _style_overlay(handle_owner: Any) -> None:
+-        """Apply WS_EX_TOOLWINDOW | NOACTIVATE so the bar never steals focus or alt-tabs."""
++    def _place_overlay(handle_owner: Any) -> None:
++        """Pin the bar to the visible work area and style it as a no-focus overlay.
++
++        ``show()`` alone is not enough on a DPI-scaled laptop: pywebview hands the
++        coordinates to the OS in one scale and the OS interprets them in another, so the
++        window can land off-screen (present in the taskbar, invisible on the desktop).
++        Re-applying the geometry with the native HWND via ``winops.move_window`` pins it
++        to the real work area regardless of scaling.
++        """
+         try:
+             import winops
+ 
+@@ -633,9 +655,10 @@ def launch(args: argparse.Namespace) -> int:
+                     hwnd = int(value)
+                     break
+             if hwnd:
++                winops.move_window(hwnd, bar_x, bar_y, bar_w, bar_h)
+                 winops.tool_window(hwnd, on_top=True, no_activate=True)
+         except Exception as exc:  # noqa: BLE001
+-            log.debug("overlay styling skipped: %s", exc)
++            log.debug("overlay placement skipped: %s", exc)
+ 
+     bar_controller.visible = False
+     config.BAR_CONTROLLER = bar_controller
+diff --git a/requirements.txt b/requirements.txt
+index f27c2fc..98a1e68 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -35,5 +35,11 @@ TTS>=0.22.0
+ # --- OS automation / telemetry ---------------------------------------------
+ psutil>=5.9
+ 
++# --- Always-on ear (background wake-word listening) ------------------------
++# sounddevice streams the laptop mic into the energy gate in wake.py; numpy is
++# its dependency.  Without it the HUD mic button still works, but JARVIS can
++# only hear you while the HUD/bar has the mic open.
++sounddevice>=0.4.6
++
+ # --- Discord bridge ---------------------------------------------------------
+ discord.py>=2.4
+diff --git a/router.py b/router.py
+index 936bbed..48ea476 100644
+--- a/router.py
++++ b/router.py
+@@ -35,7 +35,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+ 
+ import tools
+ from config import SETTINGS, get_logger
+-from llm_providers import LlmError, POOL, choose_tier, looks_like_research
++from llm_providers import LlmError, POOL, choose_tier, looks_like_research, strip_reasoning
+ 
+ log = get_logger("router")
+ 
+@@ -981,7 +981,8 @@ def _spoken_from_tools(tool_log: List[Dict[str, Any]]) -> str:
+ 
+ 
+ def _clean_answer(text: str) -> str:
+-    text = (text or "").strip()
++    text = strip_reasoning(text or "")
++    text = text.strip()
+     text = re.sub(r"^(```[a-z]*\s*|\s*```$)", "", text).strip()
+     text = re.sub(r"^(assistant|jarvis)\s*:\s*", "", text, flags=re.I)
+     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+diff --git a/server.py b/server.py
+index dee594a..f4a6e01 100644
+--- a/server.py
++++ b/server.py
+@@ -1477,6 +1477,25 @@ def create_app() -> FastAPI:
+         ext = "wav" if "wav" in ctype else ("pcm" if "pcm" in ctype else "webm")
+         return await _process_audio(body, ext, source="rest-mic")
+ 
++    def _stt_problem(transcript: Any) -> Optional[str]:
++        """Translate a silent/empty transcript into the *real* reason, when there is one.
++
++        ``transcribe_*`` returns an empty ``text`` for several very different reasons:
++        the mic was silent, or faster-whisper never loaded, or ffmpeg could not decode the
++        clip.  Reporting all of them as "no speech detected" is exactly why JARVIS appears
++        to ignore the user — the actual fault is hidden behind a red herring.
++        """
++        engine = str(getattr(transcript, "engine", "") or "")
++        if engine == "unavailable":
++            return "speech-to-text model is not loaded — faster-whisper is missing or failed to start (see the terminal)"
++        if engine == "missing-file":
++            return "the microphone audio file could not be read"
++        if engine.startswith("decode-error:"):
++            return f"could not decode the microphone audio: {engine[len('decode-error:'):]}"
++        if engine.startswith("error:"):
++            return f"speech-to-text failed: {engine[len('error:'):]}"
++        return None
++
+     @app.post("/api/transcribe")
+     async def post_transcribe(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
+         """``{"audio_base64": "...", "format": "wav", "speak": false, "command": true}``.
+@@ -1500,10 +1519,13 @@ def create_app() -> FastAPI:
+         ext = Path(ext).suffix.lstrip(".") if Path(ext).suffix else ext
+         if ext not in {"wav", "webm", "ogg", "opus", "m4a", "mp3", "aac", "pcm"}:
+             ext = "webm"
+-        transcript = await asyncio.to_thread(voice.listen, raw, ext)
++        if ext == "pcm":
++            transcript = await asyncio.to_thread(voice.stt.transcribe_pcm, raw, TARGET_SR)
++        else:
++            transcript = await asyncio.to_thread(voice.listen, raw, ext)
+         result: Dict[str, Any] = {"ok": bool(transcript.text), "transcript": transcript.as_dict()}
+         if not transcript.text:
+-            result["error"] = transcript.engine if transcript.engine.startswith(("decode-error", "error")) else "no speech detected"
++            result["error"] = _stt_problem(transcript) or "no speech detected"
+             return result
+         if command:
+             result["reply"] = await handle_command(transcript.text, source="mic", speak=bool(speak))
+@@ -1516,7 +1538,11 @@ def create_app() -> FastAPI:
+             transcript = await asyncio.to_thread(voice.listen, body, ext)
+         if not transcript.text:
+             set_mode("idle")
+-            return {"ok": False, "error": "no speech detected", "transcript": transcript.as_dict()}
++            problem = _stt_problem(transcript)
++            if problem:
++                TERMINAL.push("warn", problem)
++            return {"ok": False, "error": problem or "no speech detected",
++                    "transcript": transcript.as_dict()}
+         HUB.emit({"type": "transcript", **transcript.as_dict()})
+         reply = await handle_command(transcript.text, source=source, speak=SETTINGS.speak_replies)
+         return {"ok": True, "transcript": transcript.as_dict(), "reply": reply}
+diff --git a/static/arc_reactor.js b/static/arc_reactor.js
+index e0bb8d5..579cc65 100644
+--- a/static/arc_reactor.js
++++ b/static/arc_reactor.js
+@@ -1113,6 +1113,8 @@ let chunks = [];
+ let tapMode = false;
+ let holdTimer = 0;
+ let holding = false;
++let clipNode = null;        // ScriptProcessor capturing 16 kHz PCM for a mic clip
++let clipChunks = null;      // Float32Array[] at 16 kHz, accumulated while the mic is held
+ let workletNode = null;
+ let scriptNode = null;
+ let streamSamples = null;   // float32 accumulation between flushes
+@@ -1165,6 +1167,11 @@ async function startMic(toggle = false) {
+ 
+   if (state.liveStream) { startLiveStream(); return; }
+ 
++  // Preferred: capture raw 16 kHz PCM so the core can transcribe it with NO ffmpeg.
++  // (ffmpeg is a separate manual install; the old MediaRecorder path silently produced
++  // webm/opus clips that decode to nothing on a machine without it.)
++  if (captureClip()) return;
++
+   chunks = [];
+   const mimeType = pickMimeType();
+   try {
+@@ -1178,6 +1185,66 @@ async function startMic(toggle = false) {
+   recorder.start(250);
+ }
+ 
++function captureClip() {
++  try {
++    const inputRate = audioCtx.sampleRate;
++    clipChunks = [];
++    clipNode = audioCtx.createScriptProcessor(1024, 1, 1);
++    clipNode.onaudioprocess = (event) => {
++      clipChunks.push(downsample(new Float32Array(event.inputBuffer.getChannelData(0)), inputRate, 16000));
++    };
++    // ScriptProcessor must be pulled; route it into a silent gain so it never feeds back.
++    const sink = audioCtx.createGain();
++    sink.gain.value = 0;
++    micSource.connect(clipNode);
++    clipNode.connect(sink);
++    sink.connect(audioCtx.destination);
++    return true;
++  } catch (error) {
++    log('warn', `PCM capture unavailable (${error.message}) — falling back to compressed clip`);
++    clipNode = null;
++    clipChunks = null;
++    return false;
++  }
++}
++
++function stopClipCapture() {
++  if (clipNode) {
++    try { micSource.disconnect(clipNode); clipNode.disconnect(); } catch { /* already gone */ }
++  }
++  clipNode = null;
++  if (!clipChunks || !clipChunks.length) { clipChunks = null; return null; }
++  const total = clipChunks.reduce((sum, part) => sum + part.length, 0);
++  const merged = new Float32Array(total);
++  let offset = 0;
++  for (const part of clipChunks) { merged.set(part, offset); offset += part.length; }
++  clipChunks = null;
++  const pcm = new Int16Array(merged.length);
++  for (let i = 0; i < merged.length; i += 1) pcm[i] = clamp(merged[i], -1, 1) * 0x7fff | 0;
++  return pcm;
++}
++
++function sendClip(bytes, format, size, button) {
++  const kb = (size / 1024).toFixed(0);
++  if (send({ type: 'mic', format, data: base64FromBytes(bytes), size })) {
++    log('sys', `clip sent over ws · ${kb} kB · ${format}`);
++    button?.classList.remove('busy');
++  } else {
++    fetch(`${backendOrigin()}/api/listen`, {
++      method: 'POST',
++      headers: { 'content-type': `audio/${format}` },
++      body: bytes,
++    }).then(() => {
++      log('sys', `clip sent over http · ${kb} kB · ${format}`);
++      button?.classList.remove('busy');
++    }).catch((error) => {
++      log('err', `mic upload failed: ${error.message}`);
++      button?.classList.remove('busy');
++      setMode('idle');
++    });
++  }
++}
++
+ function stopMic() {
+   const button = $('btn-mic');
+   clearTimeout(holdTimer);
+@@ -1187,6 +1254,19 @@ function stopMic() {
+   button?.classList.add('busy');
+ 
+   if (state.liveStream) { stopLiveStream(); button?.classList.remove('busy'); setMode('thinking', 'closing stream'); return; }
++
++  if (clipNode) {
++    const pcm = stopClipCapture();
++    if (!pcm || pcm.length * 2 < 3200) {   // under ~0.1 s of 16 kHz mono
++      log('warn', 'clip too short — hold the mic button while speaking');
++      button?.classList.remove('busy');
++      setMode('idle');
++      return;
++    }
++    sendClip(pcm.buffer, 'pcm', pcm.length * 2, button);
++    return;
++  }
++
+   if (!recorder || recorder.state === 'inactive') { button?.classList.remove('busy'); setMode('idle'); return; }
+ 
+   recorder.onstop = async () => {
+diff --git a/wake.py b/wake.py
+index 7f1c653..6a4efb4 100644
+--- a/wake.py
++++ b/wake.py
+@@ -351,6 +351,12 @@ class WakeListener:
+         text = (getattr(transcript, "text", "") or "").strip()
+         seconds = len(pcm) / 2 / SAMPLE_RATE
+         if not text:
++            # "Nothing heard" and "the STT engine is broken" are different problems; only
++            # report the latter, or the HUD will keep saying "ready" while the ear is deaf.
++            engine = str(getattr(transcript, "engine", "") or "")
++            if engine in {"unavailable", "missing-file"} or engine.startswith(("decode-error", "error")):
++                self.state["reason"] = f"STT: {engine}"
++                self._publish()
+             return
+         with self._lock:
+             self.state["heard"] = int(self.state.get("heard", 0)) + 1
+diff --git a/winops.py b/winops.py
+index 44ced31..b980636 100644
+--- a/winops.py
++++ b/winops.py
+@@ -901,6 +901,30 @@ def screen_size() -> List[int]:
+     return [int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))]
+ 
+ 
++def work_area() -> List[int]:
++    """The desktop rectangle *excluding* the taskbar: ``[x, y, width, height]``.
++
++    ``screen_size()`` reports the full primary monitor (taskbar included), so a
++    window positioned with it can end up under the taskbar or, on a DPI-scaled
++    laptop, entirely off-screen.  This is the geometry the floating bar should
++    actually be placed inside.
++    """
++    if not IS_WINDOWS or user32 is None:
++        return [0, 0, 0, 0]
++    try:
++        from ctypes import wintypes
++
++        rect = wintypes.RECT()
++        SPI_GETWORKAREA = 0x0030
++        if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
++            return [int(rect.left), int(rect.top), int(rect.right - rect.left),
++                    int(rect.bottom - rect.top)]
++    except Exception:  # noqa: BLE001 - any failure here just means "unknown geometry"
++        pass
++    size = screen_size()
++    return [0, 0, int(size[0]), int(size[1])]
++
++
+ # ---------------------------------------------------------------------------- clipboard
+ def clipboard_read() -> Dict[str, Any]:
+     if not IS_WINDOWS:
+-- 
+2.39.5
+
