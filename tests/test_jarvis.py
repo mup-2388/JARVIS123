@@ -39,6 +39,7 @@ import screen  # noqa: E402
 import wake  # noqa: E402
 import reminders  # noqa: E402
 import llm_providers  # noqa: E402
+import winops  # noqa: E402
 import server  # noqa: E402
 import tools  # noqa: E402
 from audio_engine import ENGINE as voice  # noqa: E402
@@ -595,10 +596,29 @@ class TestJsApiSurface(unittest.TestCase):
         self.assertIsInstance(result["ok"], bool)                 # reported, never raised
 
 
+class EnvOnly:
+    """Make ``config.dotenv`` read ``os.environ`` only, until the test ends.
+
+    ``dotenv`` answers ``os.environ`` first and the ``.env`` file second, and a blank environment
+    value counts as unset.  That is right for a person and fatal for a test: on the only machine
+    that matters - the user's laptop, whose ``.env`` holds a real Groq key - "no key at all" and
+    "this key only" cannot be expressed by deleting environment variables, so the file has to come
+    out of the reader's view.  ``addCleanup`` restores it even when the test raises.
+    """
+
+    @staticmethod
+    def install(test):
+        real = config.dotenv
+        config.dotenv = lambda key, default="": os.environ.get(key, default)
+        test.addCleanup(setattr, config, "dotenv", real)
+
+
 class TestLlmProviders(unittest.TestCase):
     """Pool rotation, quota cooldowns and tier selection -- all offline."""
 
     def setUp(self):
+        EnvOnly.install(self)          # .env on this box may hold real keys
+
         import llm_providers as lp
 
         self.lp = lp
@@ -769,8 +789,7 @@ class TestLlmProviders(unittest.TestCase):
         # environment value counts as unset, which is how "KEY=" in .env.example behaves.  To test
         # "no SMART id at all" (the case where FAST must cover both tiers) the file is taken out of
         # the picture for the duration of the call.
-        real_dotenv = self.lp.config.dotenv
-        self.lp.config.dotenv = lambda key, default="": os.environ.get(key, default)
+        # (the class mixin already hides the .env file; this keeps the intent explicit)
         try:
             self.lp.ensure_custom()
             spec = self.lp.PROVIDERS["custom"]
@@ -788,7 +807,6 @@ class TestLlmProviders(unittest.TestCase):
             self.assertEqual(out["provider"], "custom")
             self.assertEqual(out["content"], "nim says hi")
         finally:
-            self.lp.config.dotenv = real_dotenv
             for name in ("CUSTOM_LLM_BASE_URL", "CUSTOM_LLM_API_KEY", "CUSTOM_LLM_MODEL_FAST"):
                 os.environ.pop(name, None)
             self.lp.ensure_custom()
@@ -922,6 +940,8 @@ class TestAgentTrack(unittest.TestCase):
     """Track 2 must actually call a provider, run the tool, then speak a summary."""
 
     def setUp(self):
+        EnvOnly.install(self)          # .env on this box may hold real keys
+
         import llm_providers as lp
 
         self.lp = lp
@@ -1049,6 +1069,8 @@ class TestModelFallback(unittest.TestCase):
                "playai-tts Array", "text-embedding-3-small")
 
     def setUp(self):
+        EnvOnly.install(self)          # .env on this box may hold real keys
+
         import dataclasses
 
         import llm_providers as lp
@@ -1462,35 +1484,6 @@ class TestFileLayer(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("append", result["message"])
 
-    def test_writes_outside_the_root_are_refused_with_the_fix(self):
-        outside_dir = Path(tempfile.mkdtemp(prefix="jarvis-outside-"))
-        try:
-            with _FileSandbox():
-                target = outside_dir / "notes-todo.txt"
-                first = files.write(str(target), "hello", mode="overwrite")
-                self.assertFalse(first["ok"])
-                self.assertIn("FILES_ALLOWED", first["message"], first)
-                self.assertFalse(target.exists(), "a refusal must not touch the disk")
-        finally:
-            shutil.rmtree(outside_dir, ignore_errors=True)
-
-    def test_a_delete_outside_the_root_asks_first_then_obeys(self):
-        outside_dir = Path(tempfile.mkdtemp(prefix="jarvis-outside-"))
-        try:
-            with _FileSandbox():
-                target = outside_dir / "keep-or-go.txt"
-                target.write_text("somebody else's file", encoding="utf-8")
-                first = files.delete(str(target))
-                self.assertFalse(first["ok"])
-                self.assertTrue(first.get("needs_confirmation"), first)
-                self.assertTrue(first.get("confirm_token"))
-                self.assertTrue(target.is_file(), "asking is not doing")
-                second = files.delete(str(target), confirm="confirm")
-                self.assertTrue(second["ok"], second)
-                self.assertFalse(target.exists())
-        finally:
-            shutil.rmtree(outside_dir, ignore_errors=True)
-
     def test_delete_goes_to_the_bin_and_undoes(self):
         with _FileSandbox() as root:
             files.write("doomed.txt", "evidence")
@@ -1547,6 +1540,75 @@ class TestFileLayer(unittest.TestCase):
             ran = files.execute_script("scripts/hello_jarvis.py")
             self.assertTrue(ran["ok"], ran)
             self.assertIn("hi from the sandbox", ran["message"])
+
+    def test_windows_paths_are_routable_by_the_file_rules(self):
+        # A drive letter used to break these: the name character class had no ":" in it, so
+        # "delete C:\Users\me\Documents\JARVIS\old.txt" matched nothing and fell through to the
+        # model.  Asserted on the pattern itself, so it is checked on every platform.
+        cases = (
+            (r"delete C:\Users\me\Documents\JARVIS\old.txt", "delete"),
+            (r"read C:\Users\me\Documents\JARVIS\notes.txt", "read"),
+            (r"create a file called C:\Users\me\Documents\JARVIS\ideas.md with milk", "write"),
+        )
+        for text, action in cases:
+            plan = server.match_instant(text)
+            self.assertIsNotNone(plan, text)
+            self.assertEqual(plan["calls"][0]["tool"], "manage_files", text)
+            self.assertEqual(plan["calls"][0]["arguments"]["action"], action, text)
+        import winops
+
+        for name in ("C:/Users/me/Documents/JARVIS/old.txt",
+                     "C:\\Users\\me\\Documents\\JARVIS\\old.txt"):
+            located, error = files.resolve_path(name)
+            if winops.IS_WINDOWS:
+                self.assertIsNotNone(located, (name, error))
+                self.assertFalse(located.inside, "a path outside the roots is never treated as inside")
+            else:
+                self.assertIsNone(located, "off Windows a drive-letter path is refused, not guessed")
+                self.assertIn("not on Windows", error)
+
+    def test_a_delete_outside_the_granted_roots_asks_first(self):
+        with _FileSandbox() as root:
+            elsewhere = root.parent.parent / "payroll.csv"      # under our temp dir, outside the root
+            elsewhere.write_text("salaries", encoding="utf-8")
+            try:
+                plan = server.match_instant(f"delete {elsewhere}")
+                self.assertIsNotNone(plan, "an absolute path must be routable")
+                self.assertTrue(plan.get("confirm"), plan)
+                self.assertIn("Recycle Bin", plan["confirm"])
+                self.assertTrue(elsewhere.is_file(), "asking is not doing")
+                # and the refusal is actionable whichever branch the platform took
+                answer = files.delete(str(elsewhere))
+                self.assertFalse(answer["ok"])
+                self.assertIn("FILES_ALLOWED", answer["message"], answer)
+            finally:
+                elsewhere.unlink(missing_ok=True)
+
+    def test_a_delete_inside_the_jarvis_folder_just_happens(self):
+        with _FileSandbox() as root:
+            (root / "scratch.txt").write_text("temporary", encoding="utf-8")
+            plan = server.match_instant("delete scratch.txt")
+            self.assertIsNone(plan.get("confirm"), plan)
+            self.assertEqual(plan["calls"][0]["tool"], "manage_files")
+            self.assertTrue(plan["calls"][0]["arguments"]["path"].endswith("scratch.txt"))
+
+    def test_an_outside_write_is_never_silent(self):
+        with _FileSandbox():
+            outside = Path(tempfile.mkdtemp(prefix="jarvis-outside-")) / "notes-todo.txt"
+            try:
+                first = files.write(str(outside), "hello", mode="overwrite")
+                self.assertFalse(first["ok"])
+                self.assertIn("FILES_ALLOWED", first["message"], first)
+                if first.get("needs_confirmation"):
+                    self.assertTrue(first.get("confirm_token"), "a confirmation needs its token")
+                    self.assertIn("confirm", first["message"].lower())
+                    # and obeying it is allowed, which is the point of asking
+                    second = files.write(str(outside), "hello", mode="overwrite", confirm="confirm")
+                    self.assertTrue(second["ok"], second)
+                    outside.unlink(missing_ok=True)
+                self.assertFalse(outside.exists(), "refusing must not touch the disk")
+            finally:
+                shutil.rmtree(outside.parent, ignore_errors=True)
 
 
 class TestScreenLayer(unittest.TestCase):
@@ -1651,6 +1713,49 @@ class TestWakeWordEar(unittest.TestCase):
         if not ok:
             self.assertGreater(len(why), 10, "an unavailable ear must explain itself")
         self.assertIn("running", wake.LISTENER.status())
+
+
+class TestWin32Constants(unittest.TestCase):
+    """The numbers Win32 expects, asserted where checking them costs nothing.
+
+    Every one of these was typed from a header once, and a wrong bit is invisible on the machine
+    where the code is written: it is a focus-stealing frame change, a context menu opening on
+    every double click, upper-case typing, or a file destroyed when it was promised to the Recycle
+    Bin.  All four happened here.  Reading each constant back against the SDK value is the only
+    test a Linux sandbox can offer for Win32 code - and it is enough to keep the mistake out.
+    """
+
+    def test_the_recycle_bin_bit_is_the_undo_bit(self):
+        self.assertEqual(winops.FOF_ALLOWUNDO, 0x0040,
+                         "0x0004 is FOF_SILENT; without the real allow-undo bit SHFileOperation "
+                         "deletes the file for good while reporting that it went to the bin")
+        for bit, name in ((winops.FOF_ALLOWUNDO, "undo"), (winops.FOF_NOCONFIRMATION, "the confirm box"),
+                          (winops.FOF_SILENT, "the progress dialog"), (winops.FOF_NOERRORUI, "the error dialog")):
+            self.assertTrue(winops.RECYCLE_FLAGS & bit, f"recycling must suppress {name}")
+        self.assertEqual(winops.RECYCLE_FLAGS, 0x0254)
+
+    def test_window_flags_do_not_steal_focus(self):
+        self.assertEqual(winops._SWP_NOACTIVATE, 0x10, "0x20 is FRAMECHANGED, not NOACTIVATE")
+        self.assertEqual(winops._SWP_FRAMECHANGED, 0x20)
+        self.assertEqual(winops._WS_EX_NOACTIVATE, 0x08000000)
+        self.assertEqual(winops._WS_EX_TOOLWINDOW, 0x80)
+        self.assertEqual((winops._SW_RESTORE, winops._SW_MINIMIZE, winops._SW_MAXIMIZE), (9, 6, 3))
+
+    def test_a_double_click_is_a_second_press_and_release(self):
+        for down, up in winops.MOUSE_BUTTONS.values():
+            combined = winops._double_click_flags(down, up)
+            self.assertEqual(combined, down | up)
+            for other_down, other_up in winops.MOUSE_BUTTONS.values():
+                if (other_down, other_up) == (down, up):
+                    continue
+                self.assertEqual(combined & (other_down | other_up), 0,
+                                 "a double click must not touch another button")
+
+    def test_typed_characters_keep_their_case(self):
+        for char in "aA$ 0é":
+            vk, scan = winops._char_event(char)
+            self.assertEqual(vk, 0, "Unicode injection sends no virtual key")
+            self.assertEqual(scan, ord(char), "the character itself is what preserves the case")
 
 
 class TestReminders(unittest.TestCase):
@@ -1795,24 +1900,6 @@ class TestDesktopWiring(unittest.TestCase):
 
     def test_a_poem_is_not_mistaken_for_a_file(self):
         self.assertNotEqual((server.match_instant("write a poem about rain") or {}).get("rule"), "files-say")
-
-    def test_a_delete_outside_the_granted_roots_asks_first(self):
-        with _FileSandbox():
-            outside = Path(files.roots()[0]).parent.parent / "payroll.csv"
-            outside.write_text("salaries", encoding="utf-8")
-            try:
-                plan = server.match_instant(f"delete {outside}")
-                self.assertTrue(plan.get("confirm"), plan)
-                self.assertIn("Recycle Bin", plan["confirm"])
-            finally:
-                outside.unlink(missing_ok=True)
-
-    def test_a_delete_inside_the_jarvis_folder_just_happens(self):
-        with _FileSandbox() as root:
-            (root / "scratch.txt").write_text("temporary", encoding="utf-8")
-            plan = server.match_instant("delete scratch.txt")
-            self.assertIsNone(plan.get("confirm"), plan)
-            self.assertEqual(plan["calls"][0]["tool"], "manage_files")
 
     def test_reminders_fire_through_the_command_funnel(self):
         self.assertTrue(callable(server.queue_spoken_command))

@@ -672,7 +672,7 @@ _FILE_SAY_RE = re.compile(
     # the "$" branch is what makes "create a file called ideas.md" work with no body at all.
     r"^(?:please )?(?:create|make|write|new)(?: a| me a| up a)?\s+(?:new\s+)?"
     r"(?:(?:text|txt|markdown|md|python|py|csv|json|html|js|script|file|document|doc|folder|directory)\s+)?"
-    r"(?:called|named|titled)?\s*['\"]?(?P<name>[\w\- .()]{2,60}?)[\"']?\s*"
+    r"(?:called|named|titled)?\s*['\"]?(?P<name>[\w\- .():\\/]{2,120}?)[\"']?\s*"
     r"(?:$(?P<body>)|(?:(?:with that says|that says|containing|with|:)\s*(?P<body2>.{1,900}?)\s*$))",
     re.I,
 )
@@ -681,13 +681,13 @@ _FILE_DELETE_RE = re.compile(
     # "get rid of my old notes".  The name class is lazy so the optional tail forces it to stop.
     r"^(?:please )?(?:delete|remove|erase|trash|get rid of)\s+(?:the\s+|my\s+|this\s+|that\s+|a\s+|an\s+)?"
     r"(?:file\s+|folder\s+|document\s+|doc\s+)?(?:called\s+|named\s+|titled\s+)?\x27?\x22?"
-    r"(?P<name>[\w\- .()\\/]{2,60}?)\x27?\x22?\s*(?:please|for me|now|thanks)?$",
+    r"(?P<name>[\w\- .():\\/]{2,120}?)\x27?\x22?\s*(?:please|for me|now|thanks)?$",
     re.I,
 )
 
 _FILE_READ_RE = re.compile(
     r"^(?:please )?(?:read|open the file|what(?:'s| is) in|summar(?:ise|ize)|check the file)\s+"
-    r"(?:the\s+|my\s+)?(?:file|doc(?:ument)?)?\s*['\"]?(?P<name>[\w\- .()\\/]{2,60})['\"]?[?.]*$",
+    r"(?:the\s+|my\s+)?(?:file|doc(?:ument)?)?\s*['\"]?(?P<name>[\w\- .():\\/]{2,120})['\"]?[?.]*$",
     re.I,
 )
 _FILE_LIST_RE = re.compile(
@@ -695,7 +695,7 @@ _FILE_LIST_RE = re.compile(
     re.I,
 )
 _FILE_SEARCH_RE = re.compile(
-    r"^(?:please )?(?:find|search for) (?:a |my )?files? (?:named |with |called )?['\"]?(?P<name>[\w\- .*()]{2,50})",
+    r"^(?:please )?(?:find|search for) (?:a |my )?files? (?:named |with |called )?['\"]?(?P<name>[\w\- .*():\\/]{2,120})",
     re.I,
 )
 _FILE_UNDO_RE = re.compile(r"^undo (?:that|it|the last (?:file )?(?:change|delete|write)|the delete)\b", re.I)

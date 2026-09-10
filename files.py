@@ -228,8 +228,11 @@ def _confirm_token(located: Located, action: str) -> str:
 
 
 def _needs_confirmation(located: Located, action: str) -> Dict[str, Any]:
+    #: Both answers name the fix.  The confirm branch used to say only "say confirm", which left
+     #: the user re-asking every day about a folder they had decided to allow.
     return _result(False, f"Say “confirm {action}” and I will do it - {located.path} is outside the "
-                          f"folders I normally touch.",
+                          f"folders I normally touch.  Add FILES_ALLOWED={located.path.parent} to .env to "
+                          f"work there without being asked.",
                    needs_confirmation=True, action=action, path=str(located.path),
                    confirm_token=_confirm_token(located, action))
 

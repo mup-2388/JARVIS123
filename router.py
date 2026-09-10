@@ -474,18 +474,18 @@ _KEYWORD_PLAN: List[Tuple[re.Pattern[str], str, Callable[[re.Match[str]], Dict[s
     (re.compile(r"\b(?:open|show|go to)\s+(?:the\s+|my\s+)?(?P<t>[a-z][a-z .&'-]{2,38}?(?:settings|panel|manager|bin|folder|center|centre))\s*$", re.I),
      "launch_app", lambda m: {"app_name": (m.group("t") or "").strip()}),
     # ---- files ------------------------------------------------------------------
-    (re.compile(r"\b(?:create|make|write|start)(?: me| up)?\s+(?:a\s+|my\s+)?(?:new\s+)?(?:(?:txt|md|markdown|py|python|csv|html|json|js|text)\s+)?(?:file|document|doc|folder|directory|script)?\s*(?:called|named|titled)?\s*['\"]?(?P<name>[\w\- .()]{2,50}?)['\"]?\s*(?:with|that says|containing)\s*['\"]?(?P<body>.{1,900})$", re.I),
+    (re.compile(r"\b(?:create|make|write|start)(?: me| up)?\s+(?:a\s+|my\s+)?(?:new\s+)?(?:(?:txt|md|markdown|py|python|csv|html|json|js|text)\s+)?(?:file|document|doc|folder|directory|script)?\s*(?:called|named|titled)?\s*['\"]?(?P<name>[\w\- .():\\/]{2,120}?)['\"]?\s*(?:with|that says|containing)\s*['\"]?(?P<body>.{1,900})$", re.I),
      "manage_files", lambda m: {"action": "write", "path": (m.group("name") or "").strip(),
                                 "content": (m.group("body") or "").strip().strip('"')}),
     (re.compile(r"\b(?:delete|remove|erase|trash|get rid of)\s+(?:the\s+|my\s+|a\s+|an\s+|this\s+|that\s+)?"
                 r"(?:file\s+|folder\s+|document\s+|doc\s+)?(?:called\s+|named\s+|titled\s+)?[\x22\x27]?"
-                r"(?P<name>[\w\- .()\\/]{2,60}?)[\x22\x27]?\s*(?:please|for me|now|thanks|dot\s+\w+)?$", re.I),
+                r"(?P<name>[\w\- .():\\/]{2,120}?)[\x22\x27]?\s*(?:please|for me|now|thanks|dot\s+\w+)?$", re.I),
      "manage_files", lambda m: {"action": "delete", "path": (m.group("name") or "").strip(" .,")}),
-    (re.compile(r"\b(?:what(?:'s| is) in|read|summar(?:ise|ize)|tell me about)\s+(?:the\s+|my\s+)?(?:file|doc(?:ument)?|notes?)\s*['\"]?(?P<name>[\w\- .()\\/]{2,60})", re.I),
+    (re.compile(r"\b(?:what(?:'s| is) in|read|summar(?:ise|ize)|tell me about)\s+(?:the\s+|my\s+)?(?:file|doc(?:ument)?|notes?)\s*['\"]?(?P<name>[\w\- .():\\/]{2,120})", re.I),
      "manage_files", lambda m: {"action": "read", "path": (m.group("name") or "").strip()}),
     (re.compile(r"\b(?:list|show)\s+(?:my|the)\s+(?:files|folder|documents|downloads)\b", re.I),
      "manage_files", lambda m: {"action": "list", "path": "downloads" if "downloads" in m.group(0).lower() else ""}),
-    (re.compile(r"\b(?:find|search for)\s+(?:a\s+|my\s+)?files?\s+(?:named\s+|with\s+)?['\"]?(?P<name>[\w\- .*()]{2,50})", re.I),
+    (re.compile(r"\b(?:find|search for)\s+(?:a\s+|my\s+)?files?\s+(?:named\s+|with\s+)?['\"]?(?P<name>[\w\- .*():\\/]{2,120})", re.I),
      "manage_files", lambda m: {"action": "search", "query": (m.group("name") or "").strip()}),
     (re.compile(r"\bundo\s+(?:that|it|the last (?:file )?(?:change|delete|write))\b", re.I),
      "manage_files", lambda m: {"action": "undo", "path": "", "content": "", "destination": "", "query": "",

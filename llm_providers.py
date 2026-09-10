@@ -929,7 +929,10 @@ class LlmPool:
                     capable = (self._health_for(key).get("discovered") or {}).get("tools") or []
                     use_tools = (bool(tools) and spec.supports_tools
                                  and (not capable or model in capable))
-                    for attempt_no in range(2):          # 2nd pass: retry without native tools
+                    #: The second request per model exists only to retry *without* a tools array.
+                    #: When no tools were asked for, sending the same body twice wastes a request on
+                    #: a metered free tier and makes one turn look like it tried a model twice.
+                    for attempt_no in range(2 if use_tools else 1):
                         started = time.perf_counter()
                         try:
                             payload = self._payload(spec, model,

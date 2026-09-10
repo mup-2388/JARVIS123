@@ -41,7 +41,35 @@ AVAILABLE = IS_WINDOWS
 
 # ---------------------------------------------------------------------------- handles / msgs
 _SW_RESTORE, _SW_MINIMIZE, _SW_MAXIMIZE, _SW_SHOW, _SW_HIDE, _SW_SHOWDEFAULT = 9, 6, 3, 5, 0, 10
-_SWP_NOSIZE, _SWP_NOMOVE, _SWP_NOACTIVATE, _SWP_SHOWWINDOW, _SWP_FRAMECHANGED = 0x1, 0x2, 0x20, 0x40, 0x20
+_SWP_NOSIZE, _SWP_NOMOVE, _SWP_NOACTIVATE, _SWP_SHOWWINDOW, _SWP_FRAMECHANGED = 0x1, 0x2, 0x10, 0x40, 0x20
+#: 0x20 is SWP_FRAMECHANGED, not SWP_NOACTIVATE - the old value asked Windows to re-frame the
+#: window and let it take focus, which is exactly what a desktop bar must never do.
+
+#: SHFileOperation fFlags (WinUser.h).  FOF_ALLOWUNDO is the bit that puts an item in the Recycle
+#: Bin instead of destroying it, so it lives here as a named constant with a test on it rather
+#: than as a literal in a call; FOF_NOERRORUI stops Windows raising a modal dialog mid-sentence.
+FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_ALLOWUNDO = 0x0004, 0x0010, 0x0200, 0x0040
+RECYCLE_FLAGS = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+
+#: MOUSEEVENTF down/up pairs.  A double click has no flag of its own - it is a second press and
+#: release - so the pair is combined, never ORed with another button's bit.
+MOUSE_BUTTONS = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}
+
+
+def _double_click_flags(down: int, up: int) -> int:
+    """dwFlags for the second press of a double click (never another button's bit)."""
+    return down | up
+
+
+def _char_event(char: str) -> Tuple[int, int]:
+    """``(wVk, wScan)`` for typing one character through ``KEYEVENTF_UNICODE``.
+
+    ``VkKeyW`` used to be consulted here, which lost the shift state - every letter arrived upper
+    case - and put a sixteen-bit value into an eight-bit field.  Sending the character itself
+    keeps case, punctuation and accents; the clipboard route is still tried first, because games
+    and DirectInput apps ignore synthetic Unicode.
+    """
+    return 0, ord(char)
 _GWL_EXSTYLE, _WS_EX_TOOLWINDOW, _WS_EX_NOACTIVATE, _WS_EX_TOPMOST, _WS_EX_APPWINDOW = -20, 0x80, 0x08000000, 0x8, 0x40000
 _HWND_TOPMOST, _HWND_NOTOPMOST = -1, -2
 
@@ -592,12 +620,12 @@ def type_text(text: str, press_enter: bool = False) -> Dict[str, Any]:
         # clipboard route failed (locked session, RDP): fall through to per-char typing
     inputs: List[_INPUT] = []
     for char in text:
-        scan = user32.VkKeyW(0, ord(char.upper())) if (IS_WINDOWS and user32 is not None) else 0
-        flags = _KEYEVENTF_UNICODE if not scan else 0
-        inputs.append(_INPUT(type=1, ki=_KEYBDINPUT(wVk=int(scan) & 0xFFFF, wScan=ord(char) if flags else 0,
-                                                   dwFlags=flags, time=0, dwExtraInfo=None)))
-        inputs.append(_INPUT(type=1, ki=_KEYBDINPUT(wVk=int(scan) & 0xFFFF, wScan=ord(char) if flags else 0,
-                                                   dwFlags=flags | _KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)))
+        vk, scan = _char_event(char)
+        inputs.append(_INPUT(type=1, ki=_KEYBDINPUT(wVk=vk, wScan=scan, dwFlags=_KEYEVENTF_UNICODE,
+                                                   time=0, dwExtraInfo=None)))
+        inputs.append(_INPUT(type=1, ki=_KEYBDINPUT(wVk=vk, wScan=scan,
+                                                   dwFlags=_KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP,
+                                                   time=0, dwExtraInfo=None)))
     if press_enter:
         inputs.append(_INPUT(type=1, ki=_KEYBDINPUT(wVk=_VK["enter"], wScan=0, dwFlags=0, time=0, dwExtraInfo=None)))
         inputs.append(_INPUT(type=1, ki=_KEYBDINPUT(wVk=_VK["enter"], wScan=0, dwFlags=_KEYEVENTF_KEYUP,
@@ -651,7 +679,7 @@ def click(x: int = -1, y: int = -1, button: str = "left", clicks: int = 1, doubl
         user32.GetCursorPos(ctypes.byref(pos))
         x, y = int(pos.x), int(pos.y)
     user32.SetCursorPos(int(x), int(y))
-    flags = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}
+    flags = MOUSE_BUTTONS
     if button.lower() not in flags:
         return _result(False, f"Unknown mouse button “{button}”.")
     down, up = flags[button.lower()]
@@ -661,10 +689,12 @@ def click(x: int = -1, y: int = -1, button: str = "left", clicks: int = 1, doubl
         inputs.append(_INPUT(type=0, mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=down, time=0, dwExtraInfo=None)))
         inputs.append(_INPUT(type=0, mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=up, time=0, dwExtraInfo=None)))
         if double and i == 0:
-            extra = down | 0x0008 if button == "left" else down
+            # A double click is just a second press and release inside the system's double-click
+            # time; the API accepts both bits in one event, which is what _double_click_flags
+            # returns.  (This used to OR in 0x0008 - MOUSEEVENTF_RIGHTDOWN - so every "double
+            # click" also poked the right mouse button and raised a context menu.)
+            extra = _double_click_flags(down, up)
             inputs.append(_INPUT(type=0, mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=extra, time=0,
-                                                        dwExtraInfo=None)))
-            inputs.append(_INPUT(type=0, mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=up, time=0,
                                                         dwExtraInfo=None)))
     out = _send(inputs)
     return {**out, "at": [int(x), int(y)], "button": button}
@@ -882,7 +912,7 @@ def recycle(paths: List[str]) -> Dict[str, Any]:
         return _result(False, "Nothing to delete.")
     if not IS_WINDOWS:
         return _result(False, "Recycle Bin needs Windows.")
-    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT = 0x0003, 0x0004, 0x0010, 0x0004
+    FO_DELETE = 0x0003
     try:
         from ctypes import wintypes
 
@@ -895,7 +925,7 @@ def recycle(paths: List[str]) -> Dict[str, Any]:
         # Double-NUL terminated list, as the API requires
         from_buffer = "\0".join(str(p) for p in paths) + "\0\0"
         op = SHFILEOPSTRUCTW(None, FO_DELETE, from_buffer, None,
-                             FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT, False, None, None)
+                             RECYCLE_FLAGS, False, None, None)
         ret = int(ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)))  # type: ignore[attr-defined]
         if ret == 0:
             return _result(True, f"{len(paths)} item(s) moved to the Recycle Bin.",
@@ -930,11 +960,22 @@ def battery() -> Dict[str, Any]:
         if not user32.GetSystemPowerStatus(ctypes.byref(status)):
             return _result(False, "Windows has no battery (desktop PC).")
         minutes = int(status.BatteryLifeTime) // 60
-        return _result(True, (f"Battery at {status.BatteryLifePercent}% "
-                             + ("charging" if status.BatteryFlag & 0x08 else "on battery" if status.ACLineStatus == 0
-                                else "plugged in")
-                             + (f", {minutes} minutes left" if minutes and minutes < 2400 else "")),
-                       percent=int(status.BatteryLifePercent), ac=int(status.ACLineStatus), minutes=minutes)
+        # BatteryFlag: 0x01 means charging, 0x08 means "no system battery" - the old code read
+        # the no-battery bit as "charging" and reported a desktop as plugged in and vice versa.
+        flag = int(status.BatteryFlag)
+        if flag & 0x08:
+            state = "no battery"
+        elif flag & 0x01:
+            state = "charging"
+        elif int(status.ACLineStatus) == 0:
+            state = "on battery"
+        else:
+            state = "plugged in"
+        return _result(True, f"Battery at {status.BatteryLifePercent}% {state}"
+                             + (f", {minutes} minutes left" if state == "on battery" and minutes
+                                and minutes < 2400 else ""),
+                       percent=int(status.BatteryLifePercent), ac=int(status.ACLineStatus),
+                       minutes=minutes, state=state)
     except Exception as exc:  # noqa: BLE001
         return _result(False, f"Power status unavailable: {exc}")
 
