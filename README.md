@@ -36,7 +36,7 @@ Markdown notes as a knowledge base, an agentic LLM brain and a Discord bridge.
 | `static/styles.css` | Meters, sparklines, terminal, pills, animations, scrollbar, webview chrome |
 | `static/arc_reactor.js` | WebGL render loop **and** the HUD client (WebSocket, telemetry, terminal, mic, cards) |
 | `notes/*.md` | Your study notes, read by `read_notes()` (German A2 + CS prep included as worked examples) |
-| `tests/test_jarvis.py` | 110 stdlib-unittest checks: schemas, regex precision, provider failover, notes scoring, VAD, REST |
+| `tests/test_jarvis.py` | 114 stdlib-unittest checks: schemas, regex precision, provider failover, notes scoring, VAD, REST |
 
 ## 2 · Setup (Windows)
 
@@ -90,7 +90,7 @@ OpenAI-compatible (or, for Cloudflare, native `/ai/run`) endpoint with stdlib
 
 | Provider | Free tier (2026-09) | Fast model | Heavy model | Key |
 | --- | --- | --- | --- | --- |
-| **Groq** | 30 req/min, 14,400 req/day on the 8B, 1,000/day on the 70B | `llama-3.1-8b-instant` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
+| **Groq** | ~30 req/min, 6K tokens/min (131K context on gpt-oss) | `openai/gpt-oss-20b` | `openai/gpt-oss-120b` | `GROQ_API_KEY` |
 | **Cerebras** | ~1M tokens/day, 30 req/min, 8K context | `llama3.1-8b` | `gpt-oss-120b` | `CEREBRAS_API_KEY` |
 | **Cloudflare Workers AI** | 10,000 Neurons/day | `@cf/meta/llama-3.1-8b-instruct` | `@cf/openai/gpt-oss-120b` | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` |
 | **Google Gemini** | 1,000 req/day on Flash-Lite, 15 req/min — quota resets **midnight Pacific** | `gemini-2.5-flash-lite` | `gemini-2.5-flash` | `GEMINI_API_KEY` |
@@ -133,6 +133,15 @@ JSON-in-prompt path, and `CUSTOM_LLM_RESET` tells the cooldown maths how its quo
    `<KEY>_MODEL_FAST` / `<KEY>_MODEL_SMART` and discovery stops bothering with that
    provider. A `401/402/403` still exiles the provider (bad key or plan) instead of
    cycling models.
+   The list is read for more than ids: `supported_features`, `output_modalities` and
+   `context_window` are honoured, so `whisper`/`orpheus` (audio), `llama-prompt-guard` /
+   `gpt-oss-safeguard` (classifiers) and a 4K-context 7B that cannot hold JARVIS's prompt +
+   15 tool schemas are skipped, and a `tools` array is only ever sent to an id that
+   advertises tool calling. Groq's defaults are now `openai/gpt-oss-20b` /
+   `openai/gpt-oss-120b`, because a free key listed on 2026-09-10 contained no
+   `llama-3.1-8b-instant` or `llama-3.3-70b-versatile` at all - the Llama pair survives as
+   fallback rungs for older accounts. `python llm_providers.py` prints the two `.env` lines
+   that match *your* key.
 5. Two consecutive DNS/TLS failures rest the whole pool for
    `LLM_OFFLINE_COOLDOWN_SECONDS`, and one turn never spends more than
    `LLM_BUDGET_SECONDS` walking providers — a frozen mic is worse than a heuristic answer.
@@ -140,7 +149,7 @@ JSON-in-prompt path, and `CUSTOM_LLM_RESET` tells the cooldown maths how its quo
 **Watch it happen.** The HUD's **AI providers** panel lists every provider with
 `● ready / ▲ cooling / ○ no key`, the model it will use, its latency average and how
 long a cooldown has left; the header pill shows which brain answered the last
-command (`groq:llama-3.1-8b-instant` vs `local-regex-planner`). Hover a provider to see
+command (`groq:openai/gpt-oss-20b` vs `local-regex-planner`). Hover a provider to see
 how many models your key can actually list, which ids were refused, and what JARVIS
 switched to. Buttons: **reset** clears cooldowns and the learned model list, **probe**
 pings each configured key with a one-word prompt (and returns its visible model ids).
@@ -206,7 +215,7 @@ Outbound: `hello`, `telemetry`, `log`, `state`, `reply`, `card`, `transcript`, `
 ## 6 · Verification
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover -s tests -v     # 110 cases, all offline
+.venv\Scripts\python.exe -m unittest discover -s tests -v     # 114 cases, all offline
 .venv\Scripts\python.exe -c "import router,json;print(json.dumps(router.TOOL_SCHEMAS[0],indent=2))"
 .venv\Scripts\python.exe -c "import llm_providers as l;print(l.POOL.configured() or 'NO KEYS');print(l.choose_tier('open steam'), l.choose_tier('compare the dative and accusative cases, then write a study plan'))"
 curl http://127.0.0.1:8760/api/telemetry

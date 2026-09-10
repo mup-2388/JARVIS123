@@ -1024,32 +1024,38 @@ class TestHudMarkup(unittest.TestCase):
 
 
 class TestModelFallback(unittest.TestCase):
-    """A retired or not-entitled model id must never cost the user the answer."""
+    """A model id the key refuses must be absorbed inside the same turn.
 
-    VISIBLE = ("llama-3.1-8b-instant", "llama-guard-4-12b", "whisper-large-v3-turbo",
-               "playai-tts Array", "meta-llama/llama-4-scout-17b-16e-instruct",
-               "gpt-oss-120b", "qwen/qwen3-32b", "text-embedding-3-small")
+    The provider object is rebuilt with invented model names so these assertions say
+    something about the failover logic and not about which id Groq happens to list this
+    month (their 2026-09 free lineup has no Llama id at all - see TestRealProviderPayloads).
+    """
+
+    VISIBLE = ("small-model", "big-model", "llama-guard-4-12b", "whisper-large-v3-turbo",
+               "playai-tts Array", "text-embedding-3-small")
 
     def setUp(self):
+        import dataclasses
+
         import llm_providers as lp
 
         self.lp = lp
-        self._dir = tempfile.mkdtemp(prefix="jarvis-model-")
+        self._dir = tempfile.mkdtemp(prefix="jarvis-modelfb-")
         self.state = Path(self._dir) / "llm.json"
         self.pool = lp.LlmPool(state_file=self.state)
         self._post, self._get = lp._post_json, lp._get_json
-        self._real_pool = lp.POOL
+        self._real_pool, self._providers = lp.POOL, dict(lp.PROVIDERS)
         lp.POOL = self.pool
+        lp.PROVIDERS["groq"] = dataclasses.replace(
+            lp.PROVIDERS["groq"], fast_model="small-model", smart_model="big-model",
+            fallback_models=(), free_quota="", reset="none")
         self._env = {}
         for name in ("GROQ_API_KEY", "CEREBRAS_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY",
                      "OPENROUTER_API_KEY", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
-                     "GITHUB_MODELS_TOKEN", "CUSTOM_LLM_BASE_URL", "LLM_AUTO_DISCOVER"):
+                     "GITHUB_MODELS_TOKEN", "CUSTOM_LLM_BASE_URL", "CUSTOM_LLM_API_KEY"):
             self._env[name] = os.environ.get(name)
+            os.environ.pop(name, None)
         os.environ["GROQ_API_KEY"] = "gsk-test"
-        for name in self._env:
-            if name != "GROQ_API_KEY":
-                os.environ.pop(name, None)
-        # discovery is on by default; keep it deterministic and offline
         self.list_calls = []
         lp._get_json = self._fake_get
 
@@ -1059,15 +1065,18 @@ class TestModelFallback(unittest.TestCase):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-        self.lp._post_json, self.lp._get_json = self._post, self._get
         self.lp.POOL = self._real_pool
+        self.lp.PROVIDERS.clear()
+        self.lp.PROVIDERS.update(self._providers)
+        self.lp._post_json, self.lp._get_json = self._post, self._get
         shutil.rmtree(self._dir, ignore_errors=True)
 
     def _fake_get(self, url, headers, timeout):
         self.list_calls.append(url)
         return 200, {}, {"data": [{"id": i} for i in self.VISIBLE]}
 
-    def _fake_post(self, ok_models, status=404, message="The model `%s` does not exist or you do not have access to it."):
+    def _fake_post(self, ok_models, status=404,
+                   message="The model `%s` does not exist or you do not have access to it."):
         sent = []
 
         def post(url, headers, payload, timeout):
@@ -1075,29 +1084,28 @@ class TestModelFallback(unittest.TestCase):
             sent.append(model)
             if model in ok_models:
                 return 200, {}, {"choices": [{"finish_reason": "stop",
-                                               "message": {"role": "assistant", "content": f"answered by {model}"}}]}
+                                              "message": {"role": "assistant",
+                                                          "content": f"answered by {model}"}}]}
             return status, {}, {"error": {"message": message % model}}
 
         self.lp._post_json = post
         return sent
 
     def test_refused_model_is_replaced_inside_the_same_turn(self):
-        # Groq's advertised smart model 404s on this account, exactly the reported failure
-        sent = self._fake_post({"llama-3.1-8b-instant"})
+        sent = self._fake_post({"small-model"})
         out = self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
-        self.assertEqual(out["content"], "answered by llama-3.1-8b-instant")
+        self.assertEqual(out["content"], "answered by small-model")
         self.assertTrue(out["model_switched"], "the caller must be able to see that a swap happened")
-        self.assertEqual(sent.count("llama-3.3-70b-versatile"), 1,
-                         "a refused model must not be hammered twice in one turn")
-        self.assertNotEqual(self.pool.model_for("groq", "smart"), "llama-3.3-70b-versatile")
+        self.assertEqual(sent.count("big-model"), 1, "a refused model must not be hammered twice in a turn")
+        self.assertNotEqual(self.pool.model_for("groq", "smart"), "big-model")
 
     def test_discovery_reads_the_key_list_once_and_ignores_non_chat_models(self):
-        self._fake_post({"llama-3.1-8b-instant"})
+        self._fake_post({"small-model"})
         self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
-        found = self.pool._health_for("groq")["discovered"]      # noqa: SLF001
-        self.assertEqual(len(self.list_calls), 1, "one /models read per TTL, not one per turn")
-        self.assertEqual(found["fast"], "llama-3.1-8b-instant")
-        self.assertEqual(found["smart"], "gpt-oss-120b", "biggest real chat model, not the 17B multimodal")
+        found = self.pool._health_for("groq")["discovered"]          # noqa: SLF001
+        self.assertEqual(len(self.list_calls), 1, "one /models read per cache window, not one per turn")
+        self.assertEqual(found["fast"], "small-model")
+        self.assertEqual(found["smart"], "big-model", "the chat model, not the guard/embedding/audio ones")
         for junk in ("whisper", "guard", "embedding", "playai-tts"):
             self.assertNotIn(junk, found["fast"] + found["smart"])
             self.assertNotIn(junk, self.pool.model_for("groq", "smart"))
@@ -1109,9 +1117,9 @@ class TestModelFallback(unittest.TestCase):
         with self.assertRaises(self.lp.LlmError):
             self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
         reloaded = self.lp.LlmPool(state_file=self.state)
-        self.assertNotEqual(reloaded.model_for("groq", "smart"), "llama-3.3-70b-versatile",
+        self.assertNotEqual(reloaded.model_for("groq", "smart"), "big-model",
                             "a restart must not spend the first turn on a known-dead id")
-        self.assertTrue(reloaded.status()["providers"][0]["rejected_models"])
+        self.assertIn("big-model", reloaded.status()["providers"][0]["rejected_models"])
 
     def test_all_models_refused_backs_off_with_an_actionable_message(self):
         self._fake_post(set())
@@ -1147,12 +1155,87 @@ class TestModelFallback(unittest.TestCase):
         self.assertEqual(quiet["groq"]["seen"], 0, "an unreadable list must be silent, not fatal")
 
     def test_status_shows_what_the_key_can_see(self):
-        self._fake_post({"llama-3.1-8b-instant"})
+        self._fake_post({"small-model"})
         self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
         provider = self.pool.status()["providers"][0]
         self.assertEqual(provider["models_seen"], len(self.VISIBLE))
         self.assertIn("llama-guard-4-12b", provider["model_ids"], "the raw list is exposed for the HUD")
-        self.assertIn("llama-3.3-70b-versatile", provider["rejected_models"])
+        self.assertIn("big-model", provider["rejected_models"])
+        self.assertEqual(provider["discovered"]["fast"], "small-model")
+
+
+class TestRealProviderPayloads(unittest.TestCase):
+    """The picker against a captured, real /models response -- the interesting edge cases."""
+
+    # Trimmed to the fields that matter, from a free Groq key on 2026-09-10.
+    GROQ = [
+        {"id": "allam-2-7b", "supported_features": ["json_mode"], "context_window": 4096,
+         "output_modalities": ["text"]},
+        {"id": "qwen/qwen3.6-27b", "supported_features": ["tools", "json_mode", "reasoning"],
+         "context_window": 131072, "output_modalities": ["text", "image"]},
+        {"id": "whisper-large-v3-turbo", "context_window": 448,
+         "output_modalities": ["transcription"]},
+        {"id": "meta-llama/llama-prompt-guard-2-86m", "supported_features": ["json_mode"],
+         "context_window": 512, "output_modalities": ["text"]},
+        {"id": "openai/gpt-oss-120b", "supported_features": ["tools", "json_mode", "structured_outputs", "reasoning"],
+         "context_window": 131072, "output_modalities": ["text"]},
+        {"id": "canopylabs/orpheus-v1-english", "context_window": 4000, "output_modalities": ["speech"]},
+        {"id": "qwen/qwen3.8-27b", "supported_features": ["tools", "json_mode", "reasoning"],
+         "context_window": 131042, "output_modalities": ["text", "image"]},
+        {"id": "openai/gpt-oss-safeguard-20b", "supported_features": ["tools", "json_mode", "structured_outputs", "reasoning"],
+         "context_window": 131072, "output_modalities": ["text"]},
+        {"id": "groq/compound", "supported_features": ["json_mode"], "context_window": 131072,
+         "output_modalities": ["text"]},
+        {"id": "groq/compound-mini", "supported_features": ["json_mode"], "context_window": 131072,
+         "output_modalities": ["text"]},
+        {"id": "openai/gpt-oss-20b", "supported_features": ["tools", "json_mode", "structured_outputs", "reasoning"],
+         "context_window": 131072, "output_modalities": ["text"]},
+    ]
+
+    def setUp(self):
+        import llm_providers as lp
+
+        self.lp = lp
+        self._pick, self._rows = lp._pick_models, lp._model_rows
+        self._post, self._get = lp._post_json, lp._get_json
+
+    def tearDown(self):
+        self.lp._pick_models, self.lp._model_rows = self._pick, self._rows
+        self.lp._post_json, self.lp._get_json = self._post, self._get
+
+    def test_groq_lineup_is_picked_sensibly(self):
+        fast, smart, capable = lp_pick(self.GROQ)
+        self.assertEqual(fast, "openai/gpt-oss-20b", "smallest tool-capable model with a real window")
+        self.assertEqual(smart, "openai/gpt-oss-120b", "the big chat model, not the 27B Qwen")
+        self.assertNotIn("allam-2-7b", capable + [fast, smart], "4K context, no tools: unusable")
+        for junk in ("whisper-large-v3-turbo", "canopylabs/orpheus-v1-english",
+                     "meta-llama/llama-prompt-guard-2-86m", "openai/gpt-oss-safeguard-20b"):
+            self.assertNotIn(junk, [fast, smart], f"{junk} must never be chosen")
+        self.assertNotIn("groq/compound", capable, "it advertises no tools, so it cannot carry a tool call")
+
+    def test_json_only_lineup_is_used_without_native_tools(self):
+        rows = [r for r in self.GROQ if "tools" not in (r.get("supported_features") or [])]
+        fast, smart, capable = lp_pick(rows)
+        self.assertEqual(capable, [])
+        self.assertIn(fast, {"groq/compound-mini", "groq/compound", "allam-2-7b"},
+                      "with no tool-capable model the picker must still find a chat model")
+
+    def test_bare_id_list_still_works(self):
+        fast, smart, capable = lp_pick(self._rows({"data": [{"id": "llama3.1-8b"},
+                                                            {"id": "gpt-oss-120b"}]}))
+        self.assertEqual((fast, smart), ("llama3.1-8b", "gpt-oss-120b"))
+        self.assertEqual(capable, [], "unknown features are not the same as 'no tools'")
+
+    def test_string_rows_and_models_prefix_are_tolerated(self):
+        rows = self._rows({"data": ["models/gemini-2.5-flash-lite", "models/gemini-2.5-flash"]})
+        self.assertEqual([r["id"] for r in rows], ["gemini-2.5-flash-lite", "gemini-2.5-flash"])
+        fast, smart, _capable = lp_pick(rows)
+        self.assertEqual((fast, smart), ("gemini-2.5-flash-lite", "gemini-2.5-flash"))
+
+
+def lp_pick(rows):
+    import llm_providers
+    return llm_providers._pick_models(rows)      # noqa: SLF001 - the picker under test
 
 
 

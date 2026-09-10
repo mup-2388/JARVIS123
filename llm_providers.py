@@ -71,7 +71,13 @@ _MODEL_BANNED = re.compile(
 _MODEL_CHAT = re.compile(
     r"instruct|chat|instant|versatile|model|llama|gemini|gpt|qwen|mistral|mixtral|deepseek"
     r"|phi|gemma|glm|kimi|magistral|devstral|scout|maverick|oss|command|nova|minimax", re.I)
-_MODEL_FAST_NAME = re.compile(r"instant|flash[-_ ]?lite|lite|mini|small|nano|tiny|turbo|8b|7b|3b|4b", re.I)  # a retired model id will not come back within the hour
+_MODEL_FAST_NAME = re.compile(
+    r"instant|flash[-_ ]?lite|\blite\b|\bmini\b|small|nano|tiny|turbo|(?<!\d)[2-9]b(?!\d)", re.I)
+_MODEL_SMART_NAME = re.compile(
+    r"(?<!\d)(2[7-9]|[3-9]\d|1\d\d)b(?!\d)|large|plus|flash|scout|maverick|\bpro\b|thinking|reasoner", re.I)
+# A model with a smaller window than this cannot hold the system prompt + tool schemas +
+# conversation memory, so it is never a useful pick for JARVIS even if the key can see it.
+MIN_USEFUL_CONTEXT = 8000  # a retired model id will not come back within the hour
 TRANSIENT_BASE_SECONDS = 120        # 5xx / timeouts, doubled per consecutive failure
 TRANSIENT_CAP_SECONDS = 30 * 60
 
@@ -109,6 +115,9 @@ class ProviderSpec:
     key_url: str = ""
     supports_tools: bool = True
     key_optional: bool = False          # local runtimes (Ollama, LM Studio) send no auth
+    # Ids worth trying if the two above are refused or not visible to this key: providers
+    # retire model names without telling anyone, and entitlements differ per account.
+    fallback_models: Tuple[str, ...] = ()
     extra_headers: Dict[str, str] = field(default_factory=dict)
 
     # -- credentials -------------------------------------------------------
@@ -192,11 +201,17 @@ PROVIDERS: Dict[str, ProviderSpec] = {
             key="groq",
             label="Groq",
             base_url="https://api.groq.com/openai/v1",
-            fast_model="llama-3.1-8b-instant",
-            smart_model="llama-3.3-70b-versatile",
+            # A live /models list from a free key (2026-09) contained no Llama id at all:
+            # the chat models are gpt-oss-20b/120b and qwen3.x-27b, plus audio, guard and
+            # 4K-context models that are useless here. Llama stays as a fallback rung for
+            # older accounts, and discovery overrides all of it per key anyway.
+            fast_model="openai/gpt-oss-20b",
+            smart_model="openai/gpt-oss-120b",
+            fallback_models=("llama-3.1-8b-instant", "llama-3.3-70b-versatile",
+                             "qwen/qwen3.6-27b", "groq/compound-mini"),
             key_env="GROQ_API_KEY",
             reset="daily-utc",
-            free_quota="30 req/min; 14,400 req/day on the 8B, 1,000 on the 70B, 6K tokens/min",
+            free_quota="~30 req/min, 6K tokens/min; gpt-oss-20b/120b + qwen3.6/3.8-27b are the free chat models now",
             key_url="https://console.groq.com/keys",
         ),
         ProviderSpec(
@@ -434,21 +449,102 @@ def _model_size(model: str) -> float:
     return found[-1] if found else 0.0
 
 
-def _pick_models(ids: List[str]) -> Tuple[str, str]:
-    """Choose (fast, smart) from the model ids one key can actually see."""
-    usable = [i for i in dict.fromkeys(ids) if i and not _MODEL_BANNED.search(i)]
-    chat = [i for i in usable if _MODEL_CHAT.search(i)] or usable
-    if not chat:
-        return "", ""
-    sized = {i: _model_size(i) for i in chat}
-    sweet = [i for i in chat if 2.0 <= sized[i] <= 14.0] or chat
+def _model_row(row: Any) -> Dict[str, Any]:
+    """One ``/models`` entry -> ``{id, tools, json, context, text_out}``; unknown stays None.
+
+    Providers shape this endpoint differently (OpenAI's ``data`` + ``supported_features``,
+    GitHub's ``model_name``, Ollama's ``name``, Gemini's ``models/x`` ids) and several say
+    nothing beyond the id, so a missing field means "not stated" and must not be read as
+    "cannot" - that difference decides whether a model is usable for tool calls.
+    """
+    if isinstance(row, str):
+        row = {"id": row}
+    if not isinstance(row, dict):
+        return {}
+    raw = str(row.get("id") or row.get("name") or row.get("model_name") or row.get("base_model") or "")
+    if not raw:
+        return {}
+    if raw.startswith("models/"):
+        raw = raw[len("models/"):]
+    feats = [str(f).lower() for f in (row.get("supported_features") or [])]
+    out_mods = [str(m).lower() for m in (row.get("output_modalities") or [])]
+    ctx = row.get("context_window") or row.get("context_length") or row.get("supported_input_tokens") or 0
+    try:
+        ctx = int(ctx)
+    except (TypeError, ValueError):
+        ctx = 0
+    return {"id": raw,
+            "tools": (("tools" in feats or "function_calling" in feats) if feats else None),
+            "json": (("json_mode" in feats or "structured_outputs" in feats) if feats else None),
+            "context": ctx or None,
+            "text_out": ("text" in out_mods) if out_mods else None}
+
+
+def _model_rows(body: Any) -> List[Dict[str, Any]]:
+    """Normalise a whole ``/models`` payload; unreadable entries are dropped."""
+    rows: Any = []
+    if isinstance(body, dict):
+        rows = body.get("data") or body.get("models") or body.get("result") or body.get("object") or []
+    elif isinstance(body, list):
+        rows = body
+    if not isinstance(rows, list):
+        return []
+    seen: List[str] = []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        entry = _model_row(row)
+        mid = entry.get("id")
+        if mid and mid not in seen:
+            seen.append(mid)
+            out.append(entry)
+    return out
+
+
+def _pick_models(rows: List[Dict[str, Any]], need_tools: bool = True) -> Tuple[str, str, List[str]]:
+    """Choose ``(fast, smart, tool_capable_ids)`` from what this key can actually see.
+
+    The ids alone are not enough: a 2026-09 Groq key lists ``allam-2-7b`` (4K window, JSON
+    only), ``whisper``/``orpheus`` (audio), ``llama-prompt-guard`` (classifiers) and
+    ``gpt-oss-safeguard`` next to the two models JARVIS wants. So the ranking is
+    tool-capable -> long-enough context -> smallest for the fast tier, biggest for smart,
+    with non-text and guard/embedding/speech models dropped outright.
+
+    ``rows`` are normalised entries from :func:`_model_rows`; raw ``/models`` dictionaries
+    are also accepted (normalised here) so callers can pass either shape.
+    """
+    raw_keys = {"supported_features", "context_window", "context_length", "output_modalities",
+                "name", "model_name", "base_model"}
+    if any(isinstance(r, dict) and (set(r) & raw_keys) for r in rows):
+        rows = [m for m in (_model_row(r) for r in rows) if m]
+    clean: List[Dict[str, Any]] = []
+    for row in rows:
+        mid = str(row.get("id") or "")
+        if not mid or _MODEL_BANNED.search(mid):
+            continue
+        if row.get("text_out") is False:          # audio / speech-only outputs
+            continue
+        clean.append(row)
+    capable = [r for r in clean if r.get("tools") is True]
+    pool = (capable if need_tools else []) or [r for r in clean if r.get("json") is not False] or clean
+    roomy = [r for r in pool if (r.get("context") or 0) >= MIN_USEFUL_CONTEXT]
+    if roomy:
+        pool = roomy
+    ids: List[str] = []
+    for row in pool:
+        mid = str(row.get("id"))
+        if mid not in ids:
+            ids.append(mid)
+    if not ids:
+        return "", "", [str(r.get("id")) for r in capable]
+    sized = {i: _model_size(i) for i in ids}
+    sweet = [i for i in ids if 2.0 <= sized[i] <= 14.0] or ids
     fast = min(sweet, key=lambda i: (0 if _MODEL_FAST_NAME.search(i) else 1, sized[i] or 999))
-    big = [i for i in chat if sized[i] >= 20.0]
+    big = [i for i in ids if sized[i] >= 20.0]
     if big:
-        smart = max(big, key=lambda i: (sized[i], 1 if re.search(r"70b|120b|405b|large|plus|flash|scout|pro", i, re.I) else 0))
+        smart = max(big, key=lambda i: (sized[i], 1 if _MODEL_SMART_NAME.search(i) else 0))
     else:
-        smart = max(chat, key=lambda i: (0 if _MODEL_FAST_NAME.search(i) else 1, sized[i]))
-    return fast, (smart if smart != fast else fast)
+        smart = max(ids, key=lambda i: (0 if _MODEL_FAST_NAME.search(i) else 1, sized[i]))
+    return fast, (smart if smart != fast else fast), [str(r.get("id")) for r in capable]
 
 
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float) -> Tuple[int, Dict[str, str], Any]:
@@ -658,7 +754,8 @@ class LlmPool:
         other = spec.fast_model if tier == "smart" else spec.smart_model
         ladder = [self.model_for(key, tier), other,
                   found.get(tier) or "", found.get("fast" if tier == "smart" else "smart") or "",
-                  found.get("fast") or "", found.get("smart") or "", wanted]
+                  found.get("fast") or "", found.get("smart") or "", wanted,
+                  *spec.fallback_models]
         out: List[str] = []
         for model in ladder:
             model = (model or "").strip()
@@ -709,24 +806,20 @@ class LlmPool:
         except Exception as exc:  # noqa: BLE001 - discovery is a bonus, never fatal
             log.debug("model discovery for %s failed: %s", spec.label, exc)
             return cached
-        rows: Any = []
-        if isinstance(body, dict):
-            rows = body.get("data") or body.get("models") or body.get("result") or body.get("object") or []
-        elif isinstance(body, list):
-            rows = body
+        rows = _model_rows(body)
         ids: List[str] = []
-        for row in rows if isinstance(rows, list) else []:
-            if isinstance(row, str):
-                ids.append(row)
-            elif isinstance(row, dict):
-                value = row.get("id") or row.get("name") or row.get("model_name") or ""
-                if value:
-                    ids.append(str(value))
-        ids = [i[len("models/"):] if i.startswith("models/") else i for i in dict.fromkeys(ids)]
-        fast, smart = _pick_models(ids)
+        for row in rows:
+            mid = str(row.get("id") or "")
+            if mid and mid not in ids:
+                ids.append(mid)
+        fast, smart, capable = _pick_models(rows)
         picked = {"at": int(time.time()), "count": len(ids), "ids": ids[:200],
-                  "fast": fast, "smart": smart or fast,
+                  "fast": fast, "smart": smart or fast, "tools": capable[:60],
+                  "context": {str(r.get("id")): r.get("context") for r in rows
+                              if r.get("context") and len(ids) <= 60},
                   "reason": "" if ids else f"HTTP {status}: no model list"}
+        if ids and not fast:
+            picked["reason"] = "no chat model with a usable context window on this key"
         with self._lock:
             health["discovered"] = picked
         self._save_state()
@@ -799,7 +892,11 @@ class LlmPool:
                     if not model or (key, model) in tried_realms:
                         continue
                     tried_realms.add((key, model))
-                    use_tools = bool(tools) and spec.supports_tools
+                    # A model that only advertises json_mode will 400 on a tools array, so
+                    # ask for native tool calls only of the ids this key can see that support them.
+                    capable = (self._health_for(key).get("discovered") or {}).get("tools") or []
+                    use_tools = (bool(tools) and spec.supports_tools
+                                 and (not capable or model in capable))
                     for attempt_no in range(2):          # 2nd pass: retry without native tools
                         started = time.perf_counter()
                         try:
@@ -1189,8 +1286,15 @@ def _cli(argv: Optional[List[str]] = None) -> int:  # pragma: no cover - manual 
             found = POOL.discover(key, force=True) or {}
             ids = list(found.get("ids") or [])
             if ids:
+                capable = list(found.get("tools") or [])
+                skipped = [i for i in ids if i not in set(capable) | {found.get("fast"), found.get("smart")}]
                 print(f"    key can see  : {len(ids)} models -> {', '.join(ids[:12])}"
                       f"{' …' if len(ids) > 12 else ''}")
+                print(f"    usable for   : {len(capable)} with native tool calls"
+                      f"{' (' + ', '.join(capable[:6]) + ')' if capable else ''}")
+                if skipped:
+                    print(f"    ignored      : {', '.join(skipped[:8])}{' …' if len(skipped) > 8 else ''}"
+                          "   (audio/guard/embedding, no tool support, or too small a context)")
                 print(f"    chosen       : fast={found.get('fast') or '-'}  smart={found.get('smart') or '-'}")
                 code = 0
             else:
@@ -1221,9 +1325,12 @@ def _cli(argv: Optional[List[str]] = None) -> int:  # pragma: no cover - manual 
             for attempt in getattr(exc, "attempts", []) or []:
                 print(f"    - {attempt.get('provider')} {attempt.get('model', '')} "
                       f"{attempt.get('status', '')} {str(attempt.get('error'))[:120]}")
-    print("\n  Fix it: put a working key in .env, or pin the ids this account can use, e.g.")
-    print("    GROQ_MODEL_FAST=llama-3.1-8b-instant")
-    print("    GROQ_MODEL_SMART=llama-3.1-8b-instant     (or any bigger id from the list above)")
+    print("\n  If a turn still comes back empty, put these two lines in .env - they are the ids")
+    print("  this exact key was just seen to accept, so nothing has to be guessed at runtime:")
+    for key in POOL.configured():
+        print(f"    {key.upper()}_MODEL_FAST={POOL.model_for(key, 'fast')}")
+        print(f"    {key.upper()}_MODEL_SMART={POOL.model_for(key, 'smart')}")
+    print("  (Also check the keys themselves; a 401/403 is an account problem, not a model one.)")
     return code
 
 
