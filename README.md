@@ -43,7 +43,7 @@ Markdown notes as a knowledge base, an agentic LLM brain and a Discord bridge.
 | `static/styles.css` | Meters, sparklines, terminal, pills, animations, scrollbar, webview chrome |
 | `static/arc_reactor.js` | WebGL render loop **and** the HUD client (WebSocket, telemetry, terminal, mic, cards) |
 | `notes/*.md` | Your study notes, read by `read_notes()` (German A2 + CS prep included as worked examples) |
-| `tests/test_jarvis.py` | 171 stdlib-unittest checks: schemas, regex precision, provider failover, app resolution, file journaling, screen ranking, wake gate, timers, REST |
+| `tests/test_jarvis.py` | 179 stdlib-unittest checks: schemas, regex precision, provider failover, app resolution, file journaling, screen ranking, wake gate, timers, REST |
 
 ## 2 · Setup (Windows)
 
@@ -222,7 +222,7 @@ Outbound: `hello`, `telemetry`, `log`, `state`, `reply`, `card`, `transcript`, `
 ## 6 · Verification
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover -s tests -v     # 171 cases, all offline; they pass with or without a key in .env
+.venv\Scripts\python.exe -m unittest discover -s tests -v     # 179 cases, all offline; they pass with or without a key in .env
 .venv\Scripts\python.exe -c "import router,json;print(json.dumps(router.TOOL_SCHEMAS[0],indent=2))"
 .venv\Scripts\python.exe -c "import llm_providers as l;print(l.POOL.configured() or 'NO KEYS');print(l.choose_tier('open steam'), l.choose_tier('compare the dative and accusative cases, then write a study plan'))"
 curl http://127.0.0.1:8760/api/telemetry
@@ -303,8 +303,18 @@ Vision-capable models are chosen from each key's `/models` metadata (`input_moda
 screenshot is never sent to a text-only id such as `gpt-oss-20b`.
 ## 7 · Troubleshooting
 
+When anything on the desktop misbehaves, run the self-check first - it asks Windows what it is
+allowed to do and prints one line per subsystem (bindings, window list, app index, screen grab),
+naming the feature each gap costs.  It launches nothing and writes nothing outside a temp PNG.
+
+```powershell
+.venv\Scripts\python.exe winops.py      # and the same numbers appear in the HUD's desktop panel
+```
+
 | Symptom | Cause → fix |
 | --- | --- |
+| `ShellExecute failed … function 'ShellExecuteW' not found`, nothing opens | a Win32 entry point taken from the wrong DLL (fixed here: `ShellExecuteW` is shell32, `BitBlt` is gdi32, `GetSystemPowerStatus` is kernel32). If any variant returns, `python winops.py` names the binding |
+| "look at my screen" always refuses, `screen grab` row is `[XX]` | GDI capture blocked - remote/locked session or a GPU driver without a desktop DC; `python main.py` also prints the same gap at boot |
 | HUD says `link offline`, retries forever | core not up / wrong port → `python main.py --url` or check `JARVIS_PORT` |
 | `no speech detected` on every clip | `ffmpeg` missing (`winget install Gyan.FFmpeg`) or mic privacy lock-out |
 | XTTS never loads | reference wav missing/short, or the Coqui model is not downloaded yet (first run pulls ~2 GB) |

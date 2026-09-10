@@ -149,6 +149,10 @@ def preflight() -> Dict[str, Any]:
         report["apps_known"] = len(_apps.known_names())
         report["files_roots"] = [str(p) for p in _files.roots()]
         report["windows_session"] = bool(_winops.IS_WINDOWS)
+        report["win32"] = _winops.win32_health()
+        if not report["win32"].get("ok"):
+            log.warning("desktop layer gap reported by Windows itself: %s",
+                        report["win32"].get("message"))
         report["ocr_ready"] = bool(_screen.ocr().get("ok"))
         try:
             import wake as _wake

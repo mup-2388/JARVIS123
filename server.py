@@ -1732,6 +1732,9 @@ def create_app() -> FastAPI:
                        "vision": SETTINGS.screen_vision_enabled},
             "reminders": {"count": len(_reminders_list()), "enabled": SETTINGS.reminders_enabled},
             "listening": _wake_status(),
+            # Bound first, so a Win32 entry point that could not be resolved is a red chip on the
+            # panel instead of a mystery when the user next says "open Settings".
+            "win32": _winops.win32_health(),
         }
 
     @app.get("/api/reminders")

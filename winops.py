@@ -21,6 +21,7 @@ import ctypes
 import json
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -73,21 +74,131 @@ def _char_event(char: str) -> Tuple[int, int]:
 _GWL_EXSTYLE, _WS_EX_TOOLWINDOW, _WS_EX_NOACTIVATE, _WS_EX_TOPMOST, _WS_EX_APPWINDOW = -20, 0x80, 0x08000000, 0x8, 0x40000
 _HWND_TOPMOST, _HWND_NOTOPMOST = -1, -2
 
-user32 = shell32 = None
-if IS_WINDOWS:  # pragma: no branch - exercised on the target machine
-    try:
-        user32 = ctypes.windll.user32          # type: ignore[attr-defined]
-        ctypes.windll.kernel32.SetConsoleCtrlHandler(0, 0)  # type: ignore[attr-defined]
-        shell32 = ctypes.windll.shell32       # type: ignore[attr-defined]
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Win32 handles unavailable: %s", exc)
-        user32 = shell32 = None
-    try:  # keep argtypes right so 64-bit HWNDs are not truncated
-        user32.ShellExecuteW.restype = ctypes.c_void_p
-        user32.GetForegroundWindow.restype = ctypes.c_void_p
-        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
-    except Exception:  # noqa: BLE001
-        pass
+#: Every Win32 entry point JARVIS calls, paired with the module that actually exports it and the
+#: types that keep a 64-bit handle from arriving as a truncated ``c_int``.
+#:
+#: ctypes answers a name looked up on the wrong DLL with ``AttributeError: function 'X' not found``
+#: *at the call site*, and this file used to ask user32 for ShellExecuteW (which lives in shell32)
+#: and for BitBlt (gdi32) - so "open Settings" and "look at my screen" both died with a ctypes
+#: message instead of an app.  Worse, the three prototype lines that would have fixed the
+#: truncation sat in the same ``try`` as the bad lookup, so the first raised and none were ever
+#: configured.  Names are therefore declared here, resolved once at import, and cross-checked by
+#: TestWin32Bindings, which reads this file and the SDK ownership table back to back.
+_PROTOTYPES = (
+    # (module, function, restype, argtypes) - None means "leave ctypes' default alone".
+    ("shell32", "ShellExecuteW", ctypes.c_void_p,
+     [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+      ctypes.c_int]),
+    ("shell32", "SHFileOperationW", ctypes.c_int, [ctypes.c_void_p]),
+    ("shell32", "SHEmptyRecycleBinW", ctypes.c_int, [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint]),
+    # gdi32 - the screen grab, with no dependencies
+    ("gdi32", "CreateCompatibleDC", ctypes.c_void_p, [ctypes.c_void_p]),
+    ("gdi32", "CreateCompatibleBitmap", ctypes.c_void_p,
+     [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]),
+    ("gdi32", "SelectObject", ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_void_p]),
+    ("gdi32", "BitBlt", ctypes.c_bool,
+     [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+      ctypes.c_int, ctypes.c_int, ctypes.c_ulong]),
+    ("gdi32", "GetDIBits", ctypes.c_int,
+     [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+      ctypes.c_void_p, ctypes.c_uint]),
+    ("gdi32", "DeleteDC", ctypes.c_bool, [ctypes.c_void_p]),
+    ("gdi32", "DeleteObject", ctypes.c_bool, [ctypes.c_void_p]),
+    # user32 - windows
+    ("user32", "GetForegroundWindow", ctypes.c_void_p, None),
+    ("user32", "SetForegroundWindow", ctypes.c_bool, [ctypes.c_void_p]),
+    ("user32", "BringWindowToTop", ctypes.c_bool, [ctypes.c_void_p]),
+    ("user32", "ShowWindow", ctypes.c_bool, [ctypes.c_void_p, ctypes.c_int]),
+    ("user32", "IsWindowVisible", ctypes.c_bool, [ctypes.c_void_p]),
+    ("user32", "IsIconic", ctypes.c_bool, [ctypes.c_void_p]),
+    ("user32", "GetWindowTextLengthW", ctypes.c_int, [ctypes.c_void_p]),
+    # The calls below pass byref() results and raw buffers rather than plain ints and strings.
+    # They are typed too, because c_void_p is documented to take a pointer-sized value and was
+    # measured to accept byref(obj), create_string_buffer(n) and create_unicode_buffer(n) - so the
+    # conversion is explicit instead of left to ctypes' defaults, which is the whole reason an
+    # HWND ever arrived as a truncated c_int in the first place.
+    ("user32", "GetWindowThreadProcessId", ctypes.c_ulong, [ctypes.c_void_p, ctypes.c_void_p]),
+    ("user32", "GetWindowRect", ctypes.c_bool, [ctypes.c_void_p, ctypes.c_void_p]),
+    ("user32", "GetWindowTextW", ctypes.c_int, [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]),
+    ("user32", "GetCursorPos", ctypes.c_bool, [ctypes.c_void_p]),
+    ("user32", "GetSystemMetrics", ctypes.c_int, [ctypes.c_int]),
+    ("user32", "GetDC", ctypes.c_void_p, [ctypes.c_void_p]),
+    ("user32", "ReleaseDC", ctypes.c_int, [ctypes.c_void_p, ctypes.c_void_p]),
+    ("user32", "SetWindowPos", ctypes.c_bool,
+     [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+      ctypes.c_uint]),
+    ("user32", "GetWindowLongW", ctypes.c_long, [ctypes.c_void_p, ctypes.c_int]),
+    ("user32", "SetWindowLongW", ctypes.c_long, [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]),
+    # user32 - clipboard and input
+    ("user32", "OpenClipboard", ctypes.c_bool, [ctypes.c_void_p]),
+    ("user32", "CloseClipboard", ctypes.c_bool, []),
+    ("user32", "EmptyClipboard", ctypes.c_bool, []),
+    ("user32", "IsClipboardFormatAvailable", ctypes.c_bool, [ctypes.c_uint]),
+    ("user32", "GetClipboardData", ctypes.c_void_p, [ctypes.c_uint]),
+    ("user32", "SetClipboardData", ctypes.c_void_p, [ctypes.c_uint, ctypes.c_void_p]),
+    ("user32", "SendInput", ctypes.c_uint, [ctypes.c_uint, ctypes.c_void_p, ctypes.c_int]),
+    ("user32", "SetProcessDPIAware", ctypes.c_bool, []),
+    ("user32", "LockWorkStation", ctypes.c_bool, []),
+    ("user32", "keybd_event", None, None),
+    ("user32", "Beep", ctypes.c_bool, [ctypes.c_uint, ctypes.c_uint]),
+    ("user32", "GetAsyncKeyState", ctypes.c_short, [ctypes.c_int]),
+    ("user32", "SetCursorPos", ctypes.c_bool, [ctypes.c_int, ctypes.c_int]),
+    # kernel32
+    ("kernel32", "GetSystemPowerStatus", ctypes.c_bool, [ctypes.c_void_p]),
+    ("kernel32", "SetConsoleCtrlHandler", ctypes.c_bool, [ctypes.c_void_p, ctypes.c_bool]),
+)
+
+user32 = shell32 = gdi32 = kernel32 = None
+
+#: What could not be resolved at import, in ``"module!Function"`` form.  Filled while the
+#: prototypes are configured, read by ``win32_health()`` and printed by ``python main.py`` at
+#: boot - a laptop should never have to discover that app launching is dead by trying it.
+_WIN32_MISSING: List[str] = []
+
+#: Which promise each entry point is load-bearing for, so a missing one can be explained.
+_WIN32_FEATURES = {
+    "ShellExecuteW": "opening apps, Settings pages, .lnk shortcuts and URLs",
+    "SHFileOperationW": "the Recycle Bin (deletes fall back to my own backup folder)",
+    "SendInput": "typing and key presses into other apps",
+    "GetForegroundWindow": "knowing which window you are looking at",
+    "SetForegroundWindow": "focusing a window",
+    "SetWindowPos": "moving a window to another monitor",
+    "BitBlt": "screen capture, so \"look at my screen\"",
+    "GetDIBits": "screen capture, so \"look at my screen\"",
+    "CreateCompatibleDC": "screen capture, so \"look at my screen\"",
+    "CreateCompatibleBitmap": "screen capture, so \"look at my screen\"",
+    "GetSystemPowerStatus": "the battery readout",
+    "OpenClipboard": "clipboard read and write",
+    "GetClipboardData": "clipboard read",
+    "SetClipboardData": "pasting into another app",
+}
+
+if IS_WINDOWS:  # pragma: no cover - exercised on the target machine
+    for _module in ("user32", "shell32", "gdi32", "kernel32"):
+        try:
+            globals()[_module] = getattr(ctypes.windll, _module)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            _WIN32_MISSING.append(_module)
+            log.warning("Win32 module %s unavailable: %s", _module, exc)
+    for _module, _name, _restype, _argtypes in _PROTOTYPES:
+        _handle = globals().get(_module)
+        if _handle is None:
+            continue
+        try:
+            _proc = getattr(_handle, _name)
+            if _restype is not None:
+                _proc.restype = _restype
+            if _argtypes is not None:
+                _proc.argtypes = list(_argtypes)
+        except Exception as exc:  # noqa: BLE001
+            # Loud here, instead of "function not found" at the moment the user asks.
+            _WIN32_MISSING.append(f"{_module}!{_name}")
+            log.warning("Win32 entry point %s!%s unavailable: %s", _module, _name, exc)
+    if kernel32 is not None:
+        try:  # launched detached: a Ctrl+C or a closed console must not kill the assistant
+            kernel32.SetConsoleCtrlHandler(0, 0)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("SetConsoleCtrlHandler unavailable: %s", exc)
 
 _lock = threading.RLock()
 _cache: Dict[str, Any] = {}
@@ -127,24 +238,75 @@ def shell_execute(target: str, args: str = "", working: str = "", verb: str = "o
         opener = shutil.which("xdg-open") or shutil.which("open")
         if not opener:
             return _result(False, "No desktop opener is available on this platform.")
-        cmd = [opener, target] + ([args] if args else [])
+        cmd = [opener, target] + _split_args(args)
         try:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
             return _result(True, f"Asked the desktop to open {Path(target).name or target}.", target=target)
         except Exception as exc:  # noqa: BLE001
             return _result(False, f"Could not open {target}: {exc}", target=target)
-    if user32 is None:  # pragma: no cover - only when ctypes is crippled
-        return _run_detached(["cmd", "/c", "start", "", target] + ([args] if args else []), target)
-    try:
-        ret = int(user32.ShellExecuteW(None, verb, target, args or None, working or None, show))  # type: ignore[union-attr]
-    except Exception as exc:  # noqa: BLE001
-        return _result(False, f"ShellExecute failed for {target}: {exc}", target=target)
-    if ret > 32:
-        return _result(True, f"Opened {target}", target=target, args=args, method="shellexecute")
     names = {2: "file not found", 3: "path not found", 5: "access denied", 31: "no association",
-             32: "shared-doc error", 22: "destination needed", 1223: "cancelled by user"}
+             22: "destination needed", 32: "shared-doc error"}
+    if shell32 is None:  # pragma: no cover - only when ctypes itself is crippled
+        return _shell_fallback(target, args, "shell32.dll is not loaded")
+    try:
+        handle = shell32.ShellExecuteW(None, verb, target, args or None, working or None, show)  # type: ignore[union-attr]
+    except AttributeError as exc:
+        # "function 'ShellExecuteW' not found": a missing/wrong entry point, not a refusal, so
+        # the shell's own launchers get the turn rather than the user getting a ctypes message.
+        return _shell_fallback(target, args, f"ShellExecuteW could not be resolved ({exc})")
+    except Exception as exc:  # noqa: BLE001
+        return _shell_fallback(target, args, f"ShellExecuteW raised {exc!r}")
+    ret = int(handle or 0)
+    if ret > 32:  # HINSTANCE: anything above 32 is success
+        return _result(True, f"Opened {target}", target=target, args=args, method="shellexecute")
+    if ret in (2, 3, 5, 31):
+        # "no association"/"access denied" on a .lnk or a URI is often just this entry point being
+        # unavailable; explorer.exe reads the same association database the Start menu does.
+        return {**_shell_fallback(target, args, f"ShellExecute said: {names.get(ret, ret)}"), "code": ret}
     return _result(False, f"Windows refused to open {target} ({names.get(ret, 'error code ' + str(ret))}).",
                    target=target, code=ret)
+
+
+def _split_args(args: str) -> List[str]:
+    """Turn one argument string into real argv entries.
+
+    ``Popen([exe, "--folder C:\\My Docs"])`` quotes the whole string into a *single* argument, so
+    every launch that carried more than one flag handed the app one mangled token - "open VS Code
+    with this folder" asked it to open a file called ``--folder C:\My Docs``.  shlex splits it the
+    way cmd would, and the surrounding quotes are then dropped because argv entries carry no
+    quoting of their own.  (``shell_execute`` deliberately keeps one string: ShellExecute takes a
+    command line, not an argv array.)
+    """
+    text = str(args or "").strip()
+    if not text:
+        return []
+    try:
+        parts = shlex.split(text, posix=False, comments=False)
+    except ValueError:                     # unbalanced quote - "open it with 'foo
+        parts = text.split()
+    return [p.strip('"') if len(p) > 1 and p.startswith('"') and p.endswith('"') else p
+            for p in parts if p]
+
+
+def _shell_fallback(target: str, args: str, why: str) -> Dict[str, Any]:
+    """Open something without ShellExecute, and say which route won.
+
+    A voice assistant that answers "ShellExecute failed" is a dead end, so both of the shell's own
+    launchers are tried: they read the same association database as the Start menu, and they work
+    when the direct call was never available (a stripped ctypes, a blocked DLL, a policy that
+    forbids ShellExecute but not explorer).  ``why`` is kept in the message because the fix for a
+    policy block is different from the fix for a missing file, and the user should never have to
+    guess which one they hit.
+    """
+    for cmd, method in ((["explorer.exe", target], "explorer"),
+                        (["cmd", "/c", "start", "", target] + _split_args(args), "cmd start")):
+        out = _run_detached(cmd, target)
+        if out.get("ok"):
+            return {**out, "method": method,
+                    "message": f"Asked Windows to open {Path(target).name or target} via {method} "
+                               f"({why})."}
+    return _result(False, f"Could not open {target}: {why}, and neither explorer nor cmd start "
+                         f"would run it.", target=target)
 
 
 def _run_detached(cmd: Sequence[str], target: str = "") -> Dict[str, Any]:
@@ -166,7 +328,7 @@ def launch_exe(exe: str, args: str = "", cwd: str = "") -> Dict[str, Any]:
     resolved = expanded if Path(expanded).is_file() else (shutil.which(expanded) or "")
     if not resolved:
         return shell_execute(expanded, args, cwd)
-    argv = [resolved] + ([args] if args else [])
+    argv = [resolved] + _split_args(args)
     if not IS_WINDOWS:
         try:
             subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -926,7 +1088,7 @@ def recycle(paths: List[str]) -> Dict[str, Any]:
         from_buffer = "\0".join(str(p) for p in paths) + "\0\0"
         op = SHFILEOPSTRUCTW(None, FO_DELETE, from_buffer, None,
                              RECYCLE_FLAGS, False, None, None)
-        ret = int(ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)))  # type: ignore[attr-defined]
+        ret = int(shell32.SHFileOperationW(ctypes.byref(op)))  # type: ignore[union-attr]
         if ret == 0:
             return _result(True, f"{len(paths)} item(s) moved to the Recycle Bin.",
                            items=[Path(str(p)).name for p in paths], aborted=bool(op.fAnyOperationsAborted))
@@ -946,7 +1108,7 @@ def empty_recycle_bin() -> Dict[str, Any]:
 
 
 def battery() -> Dict[str, Any]:
-    if not IS_WINDOWS or user32 is None:
+    if not IS_WINDOWS or kernel32 is None:      # GetSystemPowerStatus is a kernel32 call
         return _result(False, "Battery status needs Windows.")
     try:
         from ctypes import wintypes
@@ -957,7 +1119,7 @@ def battery() -> Dict[str, Any]:
                         ("BatteryLifeTime", wintypes.DWORD), ("BatteryFullLifeTime", wintypes.DWORD)]
 
         status = SYSTEM_POWER_STATUS()
-        if not user32.GetSystemPowerStatus(ctypes.byref(status)):
+        if not kernel32.GetSystemPowerStatus(ctypes.byref(status)):
             return _result(False, "Windows has no battery (desktop PC).")
         minutes = int(status.BatteryLifeTime) // 60
         # BatteryFlag: 0x01 means charging, 0x08 means "no system battery" - the old code read
@@ -1034,6 +1196,26 @@ def open_folder(path: str, select: str = "") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------- misc helpers
+def win32_health() -> Dict[str, Any]:
+    """What the Windows layer could actually set up, in one sentence.
+
+    Called by ``main.preflight()`` and by ``/api/desktop`` so an unresolvable entry point shows up
+    at boot with the feature it breaks, instead of arriving as "ShellExecute failed: function
+    'ShellExecuteW' not found" in front of a user who just wanted Settings to open.
+    """
+    if not IS_WINDOWS:
+        return _result(True, "Not on Windows: the desktop calls below are simulated.",
+                       windows=False, missing=[], disabled=[])
+    if not _WIN32_MISSING:
+        return _result(True, "Win32 ready: user32, shell32, gdi32 and kernel32 are bound.",
+                       windows=True, missing=[], disabled=[])
+    disabled = sorted({f"{_WIN32_FEATURES[name.split('!')[-1]]}" for name in _WIN32_MISSING
+                       if name.split("!")[-1] in _WIN32_FEATURES})
+    message = ("Win32 gaps: " + ", ".join(_WIN32_MISSING)
+               + (".  Lost: " + "; ".join(disabled) if disabled else ""))
+    return _result(False, message, windows=True, missing=list(_WIN32_MISSING), disabled=disabled)
+
+
 def beep(times: int = 1, frequency: int = 880, duration_ms: int = 120) -> Dict[str, Any]:
     if not IS_WINDOWS or user32 is None:
         return _result(True, "(beep simulated)", simulated=True)
@@ -1053,8 +1235,9 @@ def screenshot(path: str = "", region: Optional[List[int]] = None, delay_ms: int
     target = Path(os.path.expandvars(os.path.expanduser(path))) if path else temp_path(".png")
     if delay_ms:
         time.sleep(max(0, min(int(delay_ms), 8000)) / 1000.0)
-    if not IS_WINDOWS or user32 is None:
-        return _result(False, "Screenshots need a Windows desktop session.")
+    if not IS_WINDOWS or user32 is None or gdi32 is None:
+        return _result(False, "Screenshots need a Windows desktop session with the GDI objects "
+                              "available (user32 + gdi32).")
     try:
         from ctypes import wintypes
 
@@ -1062,12 +1245,12 @@ def screenshot(path: str = "", region: Optional[List[int]] = None, delay_ms: int
         width = int(region[2] - region[0]) if region else int(user32.GetSystemMetrics(0))
         height = int(region[3] - region[1]) if region else int(user32.GetSystemMetrics(1))
         screen_dc = user32.GetDC(0)
-        mem_dc = user32.CreateCompatibleDC(screen_dc)
-        bitmap = user32.CreateCompatibleBitmap(screen_dc, width, height)
-        user32.SelectObject(mem_dc, bitmap)
+        mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+        bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        gdi32.SelectObject(mem_dc, bitmap)
         SRCCOPY, CAPTUREBLT = 0x00CC0020, 0x00000001
         src_x, src_y = (region[0], region[1]) if region else (0, 0)
-        user32.BitBlt(mem_dc, 0, 0, width, height, screen_dc, src_x, src_y, SRCCOPY | CAPTUREBLT)
+        gdi32.BitBlt(mem_dc, 0, 0, width, height, screen_dc, src_x, src_y, SRCCOPY | CAPTUREBLT)
 
         class BITMAPINFOHEADER(ctypes.Structure):
             _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
@@ -1081,10 +1264,10 @@ def screenshot(path: str = "", region: Optional[List[int]] = None, delay_ms: int
         header.biWidth, header.biHeight = width, -height
         header.biPlanes, header.biBitCount, header.biCompression = 1, 32, 0
         buffer = ctypes.create_string_buffer(width * height * 4)
-        got = user32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(header), 0)
-        user32.DeleteDC(mem_dc)
+        got = gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(header), 0)
+        gdi32.DeleteDC(mem_dc)
         user32.ReleaseDC(0, screen_dc)
-        user32.DeleteObject(bitmap)
+        gdi32.DeleteObject(bitmap)
         if not got:
             return _result(False, "The screen capture came back empty (a DRM-protected window?).")
         saved = _write_png(target, width, height, buffer.raw)
@@ -1143,10 +1326,72 @@ def key_down(vk: int) -> bool:
         return False
 
 
+def check() -> Dict[str, Any]:
+    """Run every read-only desktop probe and report what each one can actually do.
+
+    ``python winops.py`` prints this table.  It launches nothing, clicks nothing and touches no
+    file outside a temp PNG, so it is safe to run at any moment - and it is the thing to paste when
+    "it can't open apps" happens again, because it covers the five places where a laptop and a
+    sandbox disagree: the Win32 bindings themselves, the window list, the app index, the OCR
+    backend and a real screen grab.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    def probe(label: str, call: Callable[[], Any], windows_only: bool = False) -> None:
+        if windows_only and not IS_WINDOWS:
+            # Reporting a Windows-only probe as a failure on another OS teaches the wrong lesson:
+            # the point of this table is to separate "not here" from "broken here".
+            rows.append({"name": label, "ok": True, "message": "skipped - needs a Windows session"})
+            return
+        try:
+            out = call()
+        except Exception as exc:  # noqa: BLE001 - a probe that raises is exactly what we want to see
+            rows.append({"name": label, "ok": False, "message": f"raised {type(exc).__name__}: {exc}"})
+            return
+        if isinstance(out, dict):
+            rows.append({"name": label, "ok": bool(out.get("ok", True)),
+                         "message": str(out.get("message", ""))[:220]})
+        elif isinstance(out, list):
+            rows.append({"name": label, "ok": True, "message": f"{len(out)} entries"})
+        else:
+            rows.append({"name": label, "ok": out is not None, "message": str(out)[:220]})
+
+    probe("win32 bindings", win32_health)
+    probe("screen size", lambda: {"ok": all(screen_size()), "message": " x ".join(map(str, screen_size()))}, windows_only=True)
+    probe("window list", lambda: windows(), windows_only=True)
+    probe("foreground window", foreground_window, windows_only=True)
+    probe("start menu entries", lambda: start_menu_entries(), windows_only=True)
+    probe("store apps (UWP)", lambda: uwp_apps(), windows_only=True)
+    probe("app paths registry", lambda: app_paths(), windows_only=True)
+    probe("installed programs", lambda: installed_exes(), windows_only=True)
+    probe("battery", battery, windows_only=True)
+    probe("clipboard", clipboard_read, windows_only=True)
+    probe("screen grab", lambda: screenshot(str(temp_path(".png"))), windows_only=True)
+    probe("input injection", lambda: {"ok": True, "message": "SendInput bound"}
+          if "user32!SendInput" not in _WIN32_MISSING else {"ok": False, "message": "SendInput missing"})
+    problems = [row for row in rows if not row["ok"]]
+    return {"ok": not problems, "windows": bool(IS_WINDOWS), "rows": rows,
+            "problems": [row["name"] for row in problems],
+            "message": (f"{len(rows) - len(problems)}/{len(rows)} desktop probes passed"
+                        + (f" - failing: {', '.join(r['name'] for r in problems)}" if problems else ""))}
+
+
+if __name__ == "__main__":  # pragma: no cover - a human runs this on the target machine
+    report = check()
+    print(f"\nJARVIS desktop self-check  ({'Windows' if IS_WINDOWS else 'not Windows'})\n" + "-" * 66)
+    for row in report["rows"]:
+        print(f"  [{'ok' if row['ok'] else 'XX'}] {row['name']:<22} {row['message']}")
+    print("-" * 66 + f"\n{report['message']}\n")
+    if report["problems"]:
+        print("Paste the block above when reporting a problem: each line names the feature that is")
+        print("lost, and the .env setting or install that brings it back.")
+    raise SystemExit(0 if report["ok"] else 1)
+
+
 __all__ = ["IS_WINDOWS", "AVAILABLE", "shell_execute", "launch_exe", "windows", "foreground_window",
            "activate", "show_window", "tool_window", "move_window", "type_text", "press", "hotkey",
            "click", "move_mouse", "scroll", "cursor_position", "screen_size", "clipboard_read",
            "clipboard_write", "media", "volume", "lock_workstation", "set_wallpaper", "notify",
            "recycle", "empty_recycle_bin", "battery", "process_list", "kill_process", "open_folder",
            "start_menu_entries", "uwp_apps", "app_paths", "installed_exes", "screenshot", "beep",
-           "temp_path", "key_down", "run_quiet"]
+           "temp_path", "key_down", "run_quiet", "win32_health", "check"]

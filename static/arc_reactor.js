@@ -761,10 +761,14 @@ function renderDesktop(data) {
     const bits = [`${apps.known || 0} apps I can open`,
                   `files in ${(files.roots || []).length} folder${(files.roots || []).length === 1 ? '' : 's'}`,
                   `${schedule.count || 0} scheduled`];
+    const health = data.win32 || {};
     if (!data.windows) bits.push('desktop keys need Windows');
+    else if (health.ok === false) bits.push('Win32 gaps: ' + (health.missing || []).slice(0, 3).join(', '));
     sum.textContent = bits.join(' · ');
+    const unhealthy = (apps.known || 0) === 0 || health.ok === false;
+    if (health.message) sum.title = health.message;
     sum.className = 'mt-2 font-mono text-[9.5px] leading-snug '
-      + ((apps.known || 0) > 0 ? 'text-cyan-100/55' : 'text-amber-200/80');
+      + (unhealthy ? 'text-amber-200/80' : 'text-cyan-100/55');
   }
   if (roots) {
     roots.textContent = `files: ${(files.roots || []).join(', ') || 'none yet'}`.slice(0, 220);

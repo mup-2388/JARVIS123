@@ -13,6 +13,8 @@ so a normal install has it).
 
 from __future__ import annotations
 
+import ctypes
+import inspect
 import json
 import os
 import re
@@ -21,6 +23,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
+from unittest import mock
 import unittest
 import wave
 from pathlib import Path
@@ -1713,6 +1716,190 @@ class TestWakeWordEar(unittest.TestCase):
         if not ok:
             self.assertGreater(len(why), 10, "an unavailable ear must explain itself")
         self.assertIn("running", wake.LISTENER.status())
+
+
+class TestWin32Bindings(unittest.TestCase):
+    """Which DLL every entry point lives in, checked without a Windows box.
+
+    ``winops`` calls Win32 through ``ctypes.windll`` handles, and ctypes answers a name looked up
+    on the wrong module with ``AttributeError: function 'X' not found`` *at the call site*.  That
+    is precisely how "open Settings" died on the laptop: ``ShellExecuteW`` is a shell32 export and
+    was being taken from user32, ``BitBlt``/``GetDIBits``/``CreateCompatibleDC`` are gdi32 and were
+    also taken from user32 (so the screen could never be read), and ``GetSystemPowerStatus`` is
+    kernel32.  Nothing on Linux can call these, so the cheap proofs are used instead: the source is
+    audited against a table written from the SDK headers, and the code paths that decide whether
+    "open settings" works are driven with fakes.
+    """
+
+    #: Documented owner of each entry point winops uses (WinUser.h / Wingdi.h / WinBase.h /
+    #: ShellAPI.h).  Adding a call to winops without adding it here fails the audit on purpose.
+    OWNERS = {
+        # shell32 - the association database, i.e. "open this thing the way Explorer would"
+        "ShellExecuteW": "shell32", "SHFileOperationW": "shell32", "SHEmptyRecycleBinW": "shell32",
+        # gdi32 - device contexts and blitting
+        "CreateCompatibleDC": "gdi32", "CreateCompatibleBitmap": "gdi32", "SelectObject": "gdi32",
+        "BitBlt": "gdi32", "GetDIBits": "gdi32", "DeleteDC": "gdi32", "DeleteObject": "gdi32",
+        # kernel32 - memory the clipboard shares, and power
+        "GlobalAlloc": "kernel32", "GlobalLock": "kernel32", "GlobalUnlock": "kernel32",
+        "GlobalSize": "kernel32", "GetSystemPowerStatus": "kernel32",
+        "SetConsoleCtrlHandler": "kernel32",   # the call that keeps Ctrl+C from killing the run
+        # user32 - windows, clipboard, input
+        "GetForegroundWindow": "user32", "SetForegroundWindow": "user32", "BringWindowToTop": "user32",
+        "ShowWindow": "user32", "IsWindowVisible": "user32", "IsIconic": "user32", "SetWindowPos": "user32",
+        "GetWindowRect": "user32", "GetWindowLongW": "user32", "SetWindowLongW": "user32",
+        "GetWindowTextW": "user32", "GetWindowTextLengthW": "user32", "GetWindowThreadProcessId": "user32",
+        "EnumWindows": "user32", "GetSystemMetrics": "user32", "GetDC": "user32", "ReleaseDC": "user32",
+        "SetProcessDPIAware": "user32", "LockWorkStation": "user32", "SystemParametersInfoW": "user32",
+        "OpenClipboard": "user32", "CloseClipboard": "user32", "EmptyClipboard": "user32",
+        "IsClipboardFormatAvailable": "user32", "GetClipboardData": "user32", "SetClipboardData": "user32",
+        "SendInput": "user32", "keybd_event": "user32", "GetAsyncKeyState": "user32",
+        "SetCursorPos": "user32", "GetCursorPos": "user32", "Beep": "user32",
+    }
+
+    @staticmethod
+    def _source() -> str:
+        return Path(inspect.getsourcefile(winops)).read_text(encoding="utf-8")
+
+    def calls(self):
+        found = set()
+        for module, name in re.findall(r"\b(user32|shell32|gdi32|kernel32)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                                       self._source()):
+            if name != "dll":            # prose such as "shell32.dll is not loaded"
+                found.add((name, module))
+        return found
+
+    def test_every_win32_call_is_made_on_the_dll_that_exports_it(self):
+        used = self.calls()
+        self.assertGreater(len(used), 30, "the audit found almost nothing - did the regex or the "
+                                          "source layout change? A blind pass here is worse than none")
+        for name, module in sorted(used):
+            self.assertIn(name, self.OWNERS, f"{name} is called through {module} but is not declared")
+            self.assertEqual(self.OWNERS[name], module,
+                             f"{name} belongs to {self.OWNERS[name]}.dll, not {module}.dll - ctypes "
+                             f"will answer 'function not found' on the user's machine")
+
+    def test_prototypes_match_the_same_table(self):
+        seen = set()
+        for module, name, restype, _argtypes in winops._PROTOTYPES:
+            self.assertNotIn((module, name), seen, f"{module}!{name} declared twice")
+            seen.add((module, name))
+            self.assertEqual(self.OWNERS.get(name), module,
+                             f"_PROTOTYPES configures {name} on {module}")
+            if name == "ShellExecuteW":
+                # It returns an HINSTANCE.  Left as ctypes' default c_int, a handle is truncated.
+                self.assertIs(restype, ctypes.c_void_p)
+        for needed in ("ShellExecuteW", "GetForegroundWindow", "GetClipboardData", "SendInput"):
+            self.assertIn(needed, {name for _m, name, _r, _a in winops._PROTOTYPES},
+                          f"{needed} must have an explicit prototype")
+
+    def test_boot_says_what_the_windows_layer_cannot_do(self):
+        """A gap has to be visible at boot, in words, not discovered by asking for Settings."""
+        health = winops.win32_health()
+        self.assertIn("missing", health)
+        with mock.patch.object(winops, "_WIN32_MISSING", ["user32", "shell32!ShellExecuteW"]):
+            with mock.patch.object(winops, "IS_WINDOWS", True):
+                out = winops.win32_health()
+        self.assertFalse(out["ok"])
+        self.assertIn("shell32!ShellExecuteW", out["message"])
+        self.assertIn("opening apps", out["message"], "the message has to name the lost feature")
+
+    def test_the_self_check_runs_anywhere_and_names_its_probes(self):
+        """``python winops.py`` is what the user pastes when something on the desktop is dead.
+
+        It has to work on a machine with no Windows at all (it must not raise, and it must say the
+        probes were skipped rather than pretending success), and it must list every subsystem the
+        laptop has broken before - bindings, windows, app index, screen grab.
+        """
+        report = winops.check()
+        self.assertIn("rows", report)
+        names = {row["name"] for row in report["rows"]}
+        for needed in ("win32 bindings", "window list", "start menu entries", "screen size"):
+            self.assertIn(needed, names)
+        self.assertTrue(all(row["message"] for row in report["rows"]), "every row says something")
+        if not winops.IS_WINDOWS:
+            self.assertTrue(report["ok"], "a Linux run is not a failure, it is a skipped probe")
+            self.assertTrue(any("not on Windows" in row["message"] or "skipped" in row["message"]
+                               for row in report["rows"]),
+                            "skipped probes must be marked as skipped, not left out")
+
+    def test_launch_arguments_are_split_the_way_cmd_would(self):
+        self.assertEqual(winops._split_args("--new-window \"C:\\My Docs\" x"),
+                         ["--new-window", "C:\\My Docs", "x"])
+        self.assertEqual(winops._split_args(""), [])
+        self.assertEqual(winops._split_args("--unbalanced \"oops"), ["--unbalanced", '"oops'],
+                         "a broken quote must not lose the launch, only the split")
+
+    def test_launch_exe_passes_argv_and_not_one_quoted_blob(self):
+        started = []
+
+        class FakePopen:
+            pid = 4242
+
+            def __init__(self, argv, **kwargs):
+                started.append((argv, kwargs.get("cwd")))
+
+        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops.subprocess, "Popen", FakePopen):
+            out = winops.launch_exe(sys.executable, "--new-window \"C:\\My Docs\"")
+        self.assertTrue(out["ok"], out)
+        argv = started[0][0]
+        self.assertEqual(argv, [sys.executable, "--new-window", "C:\\My Docs"])
+        self.assertNotIn(" ".join(argv[1:]), argv, "two flags must not travel as one argument")
+
+    def test_shellexecute_return_code_is_not_a_boolean(self):
+        class Ok:
+            @staticmethod
+            def ShellExecuteW(*_args):
+                return 42                       # any HINSTANCE above 32 means "launched"
+
+        class Refused:
+            @staticmethod
+            def ShellExecuteW(*_args):
+                return 5                        # SE_ERR_ACCESSDENIED
+
+        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops, "shell32", Ok()):
+            out = winops.shell_execute("ms-settings:")
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["method"], "shellexecute")
+        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops, "shell32", Refused()):
+            out = winops.shell_execute("C:\\secret\\x.txt")
+            self.assertFalse(out["ok"])
+            self.assertIn("access denied", out["message"])
+            self.assertEqual(out["code"], 5)
+
+    def test_a_missing_entry_point_falls_back_to_the_shell(self):
+        """The exact laptop failure: ctypes cannot resolve the name at all.
+
+        Before this was fixed, that AttributeError became the whole answer - "ShellExecute failed
+        for ms-settings:: function 'ShellExecuteW' not found" - and no app would open.  The shell
+        launchers read the same association database, so they get the turn, and the reason that
+        forced them stays in the sentence the user hears.
+        """
+        class Broken:
+            @staticmethod
+            def ShellExecuteW(*_args):
+                raise AttributeError("function 'ShellExecuteW' not found")
+
+        tried = []
+
+        def fake_run(cmd, target=""):
+            tried.append(list(cmd))
+            return winops._result(not target.startswith("z:"), f"Started {target}")
+
+        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops, "shell32", Broken()), \
+                mock.patch.object(winops, "_run_detached", fake_run):
+            out = winops.shell_execute("ms-settings:", "")
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["method"], "explorer")
+            self.assertIn("ShellExecuteW could not be resolved", out["message"])
+            self.assertEqual(tried[0], ["explorer.exe", "ms-settings:"])
+
+            tried.clear()
+            broken_target = "z:\\gone.txt"
+            out = winops.shell_execute(broken_target)
+            self.assertFalse(out["ok"], "a fallback that also failed must not be reported as success")
+            self.assertIn("z:\\gone.txt", out["message"])
+            self.assertEqual(len(tried), 2, "explorer first, then cmd start")
+            self.assertEqual(tried[1][:4], ["cmd", "/c", "start", ""])
 
 
 class TestWin32Constants(unittest.TestCase):
