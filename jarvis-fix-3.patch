@@ -1,0 +1,815 @@
+From 6ad2472d67a1c9c10a62fae04d923ec265c19cbd Mon Sep 17 00:00:00 2001
+From: mup-2388 <288946382+mup-2388@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 19:54:18 +0000
+Subject: [PATCH] Add calendar, to-do, daily brief and email (batch 3)
+
+Real-world assistant features, all stdlib + optional SMTP, wired into both the
+agentic tool loop and the offline/Track-1 fast path:
+
+- agenda.py: a small RFC 5545 VEVENT parser + cached fetcher. Reads Google
+  Calendar "secret address in iCal format" feeds and Outlook/exported .ics files
+  (CALENDAR_ICS_URLS / CALENDAR_ICS_FILES), normalises TZID/floating/UTC times
+  to local, and serves agenda(days), next_event() and today().
+- tools: calendar_agenda, calendar_next, todo (Markdown list add/list/done/clear),
+  daily_brief (date + calendar + to-do + reminders), draft_email (writes the
+  draft to notes/drafts/ AND opens Outlook via mailto:, no credentials) and
+  send_email (SMTP when SMTP_HOST/USER/PASSWORD are set).
+- router: strict schemas + keyword-planner entries for all six tools.
+- server: Track-1 regex rules for "what's on my calendar", "good morning",
+  "what's on my todo", etc., plus /api/calendar, /api/calendar/next, /api/todo,
+  /api/brief.
+- apps: "college portal" (CBS_PORTAL_URL) and Google Classroom entries.
+- config + .env.example + README: document every new knob.
+
+Named agenda.py (not calendar.py) so the module can never shadow Python's
+stdlib calendar, which datetime.strptime imports internally.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ .env.example |  24 ++++++
+ README.md    |  16 ++++
+ agenda.py    | 232 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ apps.py      |   7 ++
+ config.py    |  22 +++++
+ router.py    |  66 ++++++++++++++-
+ server.py    |  56 +++++++++++++
+ tools.py     | 225 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 647 insertions(+), 1 deletion(-)
+ create mode 100644 agenda.py
+
+diff --git a/.env.example b/.env.example
+index 27dfa71..e4efb79 100644
+--- a/.env.example
++++ b/.env.example
+@@ -135,6 +135,30 @@ API_SPORTS_DEFAULT_TEAM=Real Madrid
+ # ---------------------------------------------------------------- OS tools
+ # Directory scanned by read_notes()
+ NOTES_DIR=notes
++# ------------------------------------------------------------------ Calendar
++# JARVIS reads your real calendars, no OAuth needed.  Google Calendar:
++#   Settings -> [calendar] -> "Secret address in iCal format" -> copy the .ics URL.
++# Outlook/Exchange: Share -> Publish this calendar -> copy the ICS link.
++# Colon/semicolon/comma separated.  Leave empty until you have a feed URL.
++CALENDAR_ICS_URLS=
++# Local exported .ics files work too (e.g. the CBS timetable export).
++CALENDAR_ICS_FILES=
++CALENDAR_LOOKAHEAD_DAYS=7
++# A fetched feed is re-used for this many minutes before re-downloading.
++CALENDAR_CACHE_MINUTES=15
++# ------------------------------------------------------------------ To-do / email
++# The everyday to-do list (one "- [ ] item" per line, Markdown).
++TODO_FILE=notes/todo.md
++# "open the college portal" -> this URL (CBS International Business School).
++CBS_PORTAL_URL=https://www.cbs.de
++# Optional SMTP so JARVIS can actually SEND email.  Leave empty to draft and
++# open Outlook via mailto: instead (zero setup, equally private).
++SMTP_HOST=
++SMTP_PORT=587
++SMTP_USER=
++SMTP_PASSWORD=
++EMAIL_FROM=
++EMAIL_DEFAULT_TO=
+ # Seconds a launched process may hang before launch_app() reports success.
+ LAUNCH_TIMEOUT=6
+ # Extra apps: NAME=C:\path\to\app.exe  (semicolon separated list)
+diff --git a/README.md b/README.md
+index 776fb80..acd74e2 100644
+--- a/README.md
++++ b/README.md
+@@ -197,6 +197,22 @@ target decide which tool runs, and a named website always beats the app list:
+ `.env`, then talk to your PC from anywhere. Toggle HUD "discord relay" to mirror local replies back
+ into the channel.
+ 
++**Your day** — calendar, to-do list, morning brief and email, wired into both tracks:
++
++| You say | JARVIS does |
++| --- | --- |
++| `what's on my calendar`, `what do I have tomorrow`, `my agenda` | reads your Google/Outlook `.ics` feed (`calendar_agenda`) |
++| `what's my next class`, `any meetings coming up` | the single next event (`calendar_next`) |
++| `good morning`, `what does my day look like` | date + calendar + to-do + reminders (`daily_brief`) |
++| `add submit the CBS assignment to my todo`, `what's on my todo`, `tick off gym` | the Markdown to-do list (`todo`) |
++| `draft an email to my professor saying…` | writes the draft to `notes/drafts/` **and** opens Outlook with it prefilled (`draft_email`, no credentials) |
++| `send an email to …` | actually sends via SMTP when `SMTP_HOST/USER/PASSWORD` are set (`send_email`) |
++| `open teams`, `open outlook`, `open the college portal` | `launch_app` (Teams/Outlook are built in; set `CBS_PORTAL_URL` for the portal) |
++
++Set up the calendar with **zero OAuth**: Google Calendar → Settings → *Secret address in iCal format*
++→ paste the URL into `CALENDAR_ICS_URLS` (Outlook: Share → Publish this calendar → ICS link).
++Exported `.ics` files (e.g. the CBS timetable) go in `CALENDAR_ICS_FILES`.
++
+ ## 5 · API
+ 
+ ```
+diff --git a/agenda.py b/agenda.py
+new file mode 100644
+index 0000000..a39c1ee
+--- /dev/null
++++ b/agenda.py
+@@ -0,0 +1,232 @@
++"""Calendar: JARVIS's day-planner, fed by the calendars the user already uses.
++
++No OAuth and no vendor SDK: Google Calendar and Outlook both let you export a
++read-only ``.ics`` feed (Google: "Settings → … → Secret address in iCal format";
++Outlook: "Share → Publish this calendar").  Paste those URLs into
++``CALENDAR_ICS_URLS`` in ``.env`` (colon/semicolon/comma separated) and JARVIS can
++answer "what's on my calendar", "what's my next class", "do I have anything
++tomorrow", and fold it into the morning brief.
++
++The same parser also reads local ``.ics`` files (``CALENDAR_ICS_FILES``), which is
++how an exported Outlook/CBS schedule lands without a live feed.
++
++Everything is stdlib ``urllib`` + a small RFC 5545 ``VEVENT`` parser, so it works
++offline on the cached copy when the network (or the calendar server) is down.
++"""
++
++from __future__ import annotations
++
++import re
++import time
++import urllib.error
++import urllib.request
++from dataclasses import dataclass
++from datetime import datetime, timedelta
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++from config import SETTINGS, get_logger
++
++log = get_logger("calendar")
++
++_UA = {"user-agent": "JARVIS-assistant/1.0 calendar"}
++
++#: Line-folding: an RFC 5545 line that starts with space/tab is a continuation.
++_FOLD = re.compile(r"\r?\n[ \t]")
++#: ``DTSTART;TZID=Europe/Berlin:20240101T090000`` -> capture the raw value.
++_PROP = re.compile(r"^(SUMMARY|DTSTART|DTEND|DTSTAMP|LOCATION|DESCRIPTION|UID)"
++                   r"(?:;[^:]*)?:(.*)$", re.I | re.M)
++_UID = re.compile(r"^UID(?:;[^:]*)?:(.*)$", re.I | re.M)
++
++
++@dataclass
++class Event:
++    """One calendar entry, already normalised to the local timezone."""
++
++    summary: str
++    start: datetime
++    end: datetime
++    location: str = ""
++    description: str = ""
++    all_day: bool = False
++    source: str = ""
++
++    @property
++    def when(self) -> str:
++        if self.all_day:
++            return self.start.strftime("%A %d %B") + " (all day)"
++        return (f"{self.start.strftime('%A %d %B, %H:%M')}"
++                f" – {self.end.strftime('%H:%M')}")
++
++    def as_dict(self) -> Dict[str, Any]:
++        return {
++            "summary": self.summary,
++            "start": self.start.isoformat(timespec="minutes"),
++            "end": self.end.isoformat(timespec="minutes"),
++            "location": self.location,
++            "description": self.description,
++            "all_day": self.all_day,
++            "when": self.when,
++            "source": self.source,
++        }
++
++
++def _unfold(text: str) -> str:
++    return _FOLD.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
++
++
++def _parse_dt(value: str, tzid: str = "") -> Optional[datetime]:
++    """Parse an iCal DATE / DATE-TIME, treating TZID/floating times as local wall time."""
++    value = value.strip()
++    if not value:
++        return None
++    if len(value) == 8 and value.isdigit():          # YYYYMMDD -> all-day
++        try:
++            return datetime.strptime(value, "%Y%m%d")
++        except ValueError:
++            return None
++    # Strip a leading TZID=...: if it survived the property regex.
++    if ":" in value and value.split(":", 1)[0].upper().startswith("TZID"):
++        value = value.split(":", 1)[1]
++    try:
++        if value.endswith("Z"):                       # UTC -> local
++            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
++            return dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
++        return datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
++    except ValueError:
++        try:
++            return datetime.strptime(value[:8], "%Y%m%d")
++        except ValueError:
++            return None
++
++
++def _parse_vevent(block: str, source: str) -> Optional[Event]:
++    if "DTSTART" not in block.upper():
++        return None
++    props: Dict[str, str] = {}
++    for match in _PROP.finditer(block):
++        props[match.group(1).upper()] = match.group(2).strip()
++
++    start_raw = props.get("DTSTART", "")
++    end_raw = props.get("DTEND", "")
++    all_day = len(start_raw.strip()) == 8 and start_raw.strip().isdigit()
++    start = _parse_dt(start_raw)
++    end = _parse_dt(end_raw) if end_raw else None
++    if start is None:
++        return None
++    if end is None:
++        end = start + timedelta(days=1) if all_day else start + timedelta(hours=1)
++
++    summary = props.get("SUMMARY", "").replace("\\,", ",").replace("\\n", "\n").strip() or "(no title)"
++    location = props.get("LOCATION", "").replace("\\,", ",").strip()
++    description = props.get("DESCRIPTION", "").replace("\\,", ",").replace("\\n", "\n").strip()
++    return Event(summary=summary, start=start, end=end, location=location,
++                 description=description, all_day=all_day, source=source)
++
++
++def parse_ics(text: str, source: str = "") -> List[Event]:
++    """Parse a whole ``.ics`` document into :class:`Event` objects."""
++    blocks = re.split(r"BEGIN:VEVENT", _unfold(text), flags=re.I)
++    events: List[Event] = []
++    for block in blocks[1:]:                         # everything before the first VEVENT is headers
++        end = re.split(r"END:VEVENT", block, flags=re.I, maxsplit=1)
++        if len(end) != 2:
++            continue
++        event = _parse_vevent(end[0], source)
++        if event is not None:
++            events.append(event)
++    return events
++
++
++# --------------------------------------------------------------------------- sources
++def _cache_path(key: str) -> Path:
++    folder = Path(SETTINGS.calendar_cache_dir or "data/calendar")
++    folder.mkdir(parents=True, exist_ok=True)
++    safe = re.sub(r"[^A-Za-z0-9_-]", "_", key)[:60] or "feed"
++    return folder / f"{safe}.ics"
++
++
++def _sources() -> List[Tuple[str, str]]:
++    """Configured feeds as ``(kind, value)`` where kind is ``url`` or ``file``."""
++    sources: List[Tuple[str, str]] = []
++    for raw in re.split(r"[:;,]", SETTINGS.calendar_ics_urls or ""):
++        url = raw.strip()
++        if url:
++            sources.append(("url", url))
++    for raw in re.split(r"[:;,]", SETTINGS.calendar_ics_files or ""):
++        path = raw.strip()
++        if path:
++            sources.append(("file", path))
++    return sources
++
++
++def _read_url(url: str, key: str) -> Optional[str]:
++    cache = _cache_path(key)
++    max_age = max(1, int(SETTINGS.calendar_cache_minutes)) * 60
++    if cache.is_file() and time.time() - cache.stat().st_mtime < max_age:
++        return cache.read_text(encoding="utf-8", errors="replace")
++    try:
++        request = urllib.request.Request(url, headers=_UA)
++        with urllib.request.urlopen(request, timeout=max(6, int(SETTINGS.calendar_timeout))) as response:
++            text = response.read().decode("utf-8", errors="replace")
++        cache.write_text(text, encoding="utf-8")
++        return text
++    except (urllib.error.URLError, OSError, ValueError) as exc:
++        log.warning("calendar feed %s unreachable: %s", url, exc)
++        if cache.is_file():                          # serve the stale copy rather than nothing
++            return cache.read_text(encoding="utf-8", errors="replace")
++        return None
++
++
++def load_events() -> Tuple[List[Event], List[str]]:
++    """Every event from every configured source, plus a list of feed errors."""
++    events: List[Event] = []
++    errors: List[str] = []
++    if not _sources():
++        return events, ["no calendar feeds configured - set CALENDAR_ICS_URLS in .env"]
++    for kind, value in _sources():
++        source_name = Path(value).name if kind == "file" else value
++        try:
++            if kind == "url":
++                text = _read_url(value, value)
++                if text is None:
++                    errors.append(f"{source_name}: unreachable")
++                    continue
++            else:
++                path = Path(value).expanduser()
++                if not path.is_file():
++                    errors.append(f"{source_name}: file not found")
++                    continue
++                text = path.read_text(encoding="utf-8", errors="replace")
++            events.extend(parse_ics(text, source_name))
++        except Exception as exc:  # noqa: BLE001 - one bad feed must not sink the day
++            errors.append(f"{source_name}: {exc}")
++            log.warning("calendar source failed: %s", exc)
++    return events, errors
++
++
++def _window(days: float) -> Tuple[datetime, datetime]:
++    now = datetime.now()
++    return now, now + timedelta(days=max(0.0, days))
++
++
++def agenda(days: float = 1.0) -> List[Event]:
++    """Events between now and ``days`` from now, soonest first."""
++    start, end = _window(days)
++    events, _ = load_events()
++    hits = [e for e in events if start <= e.start < end]
++    return sorted(hits, key=lambda e: e.start)
++
++
++def next_event() -> Optional[Event]:
++    """The very next upcoming event, regardless of how far away it is."""
++    events, _ = load_events()
++    upcoming = [e for e in events if e.end >= datetime.now()]
++    return min(upcoming, key=lambda e: e.start) if upcoming else None
++
++
++def today() -> List[Event]:
++    return agenda(1.0)
++
++
++__all__ = ["Event", "agenda", "next_event", "today", "load_events", "parse_ics"]
+diff --git a/apps.py b/apps.py
+index f49f943..61e87eb 100644
+--- a/apps.py
++++ b/apps.py
+@@ -390,6 +390,13 @@ BUILTIN: Dict[str, Dict[str, Any]] = {
+                      "aliases": {"drive", "google drive"}},
+     "maps": {"display": "Maps", "kind": "url", "target": "https://www.google.com/maps",
+              "aliases": {"maps", "google maps", "directions"}},
++    # --- school / college ---
++    #: Set the portal URL with CBS_PORTAL_URL in .env (defaults to the CBS site).
++    "college portal": {"display": "College portal", "kind": "url", "target": SETTINGS.cbs_portal_url,
++                       "aliases": {"college portal", "cbs", "school portal", "university portal", "my college",
++                                   "campus portal", "student portal", "cbs portal"}},
++    "google classroom": {"display": "Classroom", "kind": "url", "target": "https://classroom.google.com",
++                         "aliases": {"classroom", "google classroom", "classes", "my courses"}},
+ }
+ 
+ #: ``ms-settings:`` sub-pages people ask for in everyday words.
+diff --git a/config.py b/config.py
+index c801887..023a9d5 100644
+--- a/config.py
++++ b/config.py
+@@ -174,6 +174,28 @@ class Settings:
+     #: Voice reminders / timers ("remind me in 10 minutes to stretch").
+     reminders_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("REMINDERS_ENABLED"), True))
+     reminders_file: str = field(default_factory=lambda: dotenv("REMINDERS_FILE", "data/reminders.json"))
++    #: Calendar (Google/Outlook/any iCal feed).  CALENDAR_ICS_URLS takes the
++    #: read-only ".ics" URLs (Google: "secret address in iCal format"), and
++    #: CALENDAR_ICS_FILES takes exported .ics files.  Colon/semicolon/comma
++    #: separated.  With no feeds, calendar tools answer with a setup hint.
++    calendar_ics_urls: str = field(default_factory=lambda: dotenv("CALENDAR_ICS_URLS", ""))
++    calendar_ics_files: str = field(default_factory=lambda: dotenv("CALENDAR_ICS_FILES", ""))
++    calendar_lookahead_days: int = field(default_factory=lambda: _coerce_int(dotenv("CALENDAR_LOOKAHEAD_DAYS"), 7))
++    calendar_cache_minutes: int = field(default_factory=lambda: _coerce_int(dotenv("CALENDAR_CACHE_MINUTES"), 15))
++    calendar_timeout: int = field(default_factory=lambda: _coerce_int(dotenv("CALENDAR_TIMEOUT"), 8))
++    calendar_cache_dir: str = field(default_factory=lambda: dotenv("CALENDAR_CACHE_DIR", "data/calendar"))
++    #: The day's to-do list lives in this Markdown file (one "- [ ] item" per line).
++    todo_file: str = field(default_factory=lambda: dotenv("TODO_FILE", "notes/todo.md"))
++    #: School/college portal opened by "open the college portal".
++    cbs_portal_url: str = field(default_factory=lambda: dotenv("CBS_PORTAL_URL", "https://www.cbs.de"))
++    #: Optional SMTP so JARVIS can actually send email (leave empty to draft + open
++    #: the mail client via mailto: instead, which is zero-setup and just as safe).
++    smtp_host: str = field(default_factory=lambda: dotenv("SMTP_HOST", ""))
++    smtp_port: int = field(default_factory=lambda: _coerce_int(dotenv("SMTP_PORT"), 587))
++    smtp_user: str = field(default_factory=lambda: dotenv("SMTP_USER", ""))
++    smtp_password: str = field(default_factory=lambda: dotenv("SMTP_PASSWORD", ""))
++    email_from: str = field(default_factory=lambda: dotenv("EMAIL_FROM", ""))
++    email_default_to: str = field(default_factory=lambda: dotenv("EMAIL_DEFAULT_TO", ""))
+     #: Hard wall-clock ceiling for one "ask the AI" turn across *all* providers.
+     #: Better a heuristic answer in 25 s than a frozen mic for 3 minutes.
+     llm_budget_seconds: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_BUDGET_SECONDS"), 25))
+diff --git a/router.py b/router.py
+index 48ea476..7899b8b 100644
+--- a/router.py
++++ b/router.py
+@@ -275,6 +275,53 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
+         "Session/power control. Only use when the user explicitly asks: lock, sleep, shutdown, restart, cancel-shutdown.",
+         {"action": {"type": "string", "enum": ["lock", "sleep", "shutdown", "restart", "cancel-shutdown"], "description": "Power action."}},
+     ),
++    _fn(
++        "calendar_agenda",
++        "What is on the user's Google/Outlook calendar for the next N days (default 1 = today): classes, "
++        "meetings, shifts, visits. Use for 'what's on my calendar', 'what do I have tomorrow', 'my agenda', "
++        "'any meetings this week'.",
++        {"days": {"type": "string", "description": "How many days to look ahead, as digits. '1' = today, '7' = a week."}},
++    ),
++    _fn(
++        "calendar_next",
++        "The single next upcoming calendar event (class, meeting, shift…). Use for 'what's next', 'my next class', 'when's my next meeting'.",
++        {},
++    ),
++    _fn(
++        "todo",
++        "The everyday to-do list. add writes an item, list shows them, done ticks one off, clear empties it. "
++        "Use for 'add submit the CBS assignment to my todo', 'what's on my todo', 'tick off gym'.",
++        {
++            "action": {"type": "string", "enum": ["list", "add", "done", "clear"], "description": "list / add / done(remove) / clear."},
++            "text": {"type": "string", "description": "The item text for add/done."},
++        },
++    ),
++    _fn(
++        "daily_brief",
++        "The morning brief: today's date, calendar, to-do list and pending reminders in one answer. "
++        "Use for 'good morning', 'what does my day look like', 'daily brief', 'summarise my day'.",
++        {},
++    ),
++    _fn(
++        "draft_email",
++        "Write an email draft and open the mail app (Outlook/mailto) with it prefilled - no credentials needed. "
++        "Use for 'draft an email to X saying...', 'write an email to my professor'.",
++        {
++            "to": {"type": "string", "description": "Recipient address. '' to leave blank."},
++            "subject": {"type": "string", "description": "Subject line."},
++            "body": {"type": "string", "description": "Email body text."},
++        },
++    ),
++    _fn(
++        "send_email",
++        "Actually SEND an email through the SMTP server in .env (SMTP_HOST/SMTP_USER/SMTP_PASSWORD). Falls back to "
++        "drafting if SMTP is not configured. Use only when the user explicitly says 'send'.",
++        {
++            "to": {"type": "string", "description": "Recipient address."},
++            "subject": {"type": "string", "description": "Subject line."},
++            "body": {"type": "string", "description": "Email body text."},
++        },
++    ),
+ ]
+ 
+ TOOL_NAMES = {s["function"]["name"] for s in TOOL_SCHEMAS}
+@@ -555,6 +602,22 @@ _KEYWORD_PLAN: List[Tuple[re.Pattern[str], str, Callable[[re.Match[str]], Dict[s
+      "take_screenshot", lambda m: {}),
+     (re.compile(r"\b(volume|mute|louder|quieter|turn (?:it )?(?:up|down))\b", re.I),
+      "set_volume", lambda m: {"delta": 6 if re.search(r"up|louder|increase", m.string, re.I) else -6}),
++    # ---- calendar / todo / brief / email ----------------------------------------
++    (re.compile(r"\b(?:what(?:'s| is)? (?:on|in) my (?:calendar|schedule|agenda)|my agenda|"
++                r"what (?:do i have|am i doing|have i got)(?: scheduled| on)?\b)", re.I),
++     "calendar_agenda", lambda m: {"days": "7" if re.search(r"week|coming", m.string, re.I) else "1"}),
++    (re.compile(r"\b(?:next|upcoming) (?:class|lecture|meeting|shift|appointment|event)|what('s| is) (?:next|up next|coming up)\b", re.I),
++     "calendar_next", lambda m: {}),
++    (re.compile(r"\b(?:add|put|write)\b[^.]{0,60}\b(?:to (?:my )?(?:to ?do|todo|to-do|task list|checklist))\b", re.I),
++     "todo", lambda m: {"action": "add", "text": re.sub(r"^.*?(?:add|put|write)\s+", "", m.string, flags=re.I).split(" to ", 1)[0].strip(" .,")}),
++    (re.compile(r"\b(?:what(?:'s| is) (?:on )?(?:my )?(?:to ?do|todo|to-do|task list|checklist)|show (?:my )?(?:to ?do|todo|task list))\b", re.I),
++     "todo", lambda m: {"action": "list", "text": ""}),
++    (re.compile(r"\b(?:good morning|morning brief|daily brief|start my day|what does my day look like|summar(?:ise|ize) my day)\b", re.I),
++     "daily_brief", lambda m: {}),
++    (re.compile(r"\b(?:draft|write|compose)\s+(?:an?\s+)?(?:email|mail)\b", re.I),
++     "draft_email", lambda m: {"to": "", "subject": "", "body": ""}),
++    (re.compile(r"\bsend\s+(?:an?\s+)?(?:email|mail)\b", re.I),
++     "send_email", lambda m: {"to": "", "subject": "", "body": ""}),
+ ]
+ 
+ 
+@@ -574,6 +637,7 @@ _SPECIFICITY = {
+     "control_desktop": 83, "focus_app": 79, "listening": 76,
+     "take_screenshot": 80, "set_volume": 78, "close_app": 74, "launch_app": 72,
+     "play_youtube": 70, "search_on_site": 66, "open_website": 60, "system_report": 58, "get_time": 55,
++    "daily_brief": 96, "calendar_agenda": 95, "calendar_next": 93, "todo": 92, "draft_email": 90, "send_email": 89,
+     "web_search": 20,
+ }
+ 
+@@ -590,7 +654,7 @@ def heuristic_plan(text: str, allow_search: bool = True) -> List[Dict[str, Any]]
+             args = build(match)
+         except Exception:  # noqa: BLE001
+             continue
+-        if not args and name not in {"get_time", "take_screenshot"}:
++        if not args and name not in {"get_time", "take_screenshot", "daily_brief", "calendar_next"}:
+             continue
+         seen.add(name)
+         calls.append({"tool": name, "arguments": args})
+diff --git a/server.py b/server.py
+index f4a6e01..3ba5737 100644
+--- a/server.py
++++ b/server.py
+@@ -907,6 +907,37 @@ def _rule_listening(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+     return {"calls": [{"tool": "listening", "arguments": {"status": action}}]}
+ 
+ 
++_CALENDAR_RE = re.compile(
++    r"what(?:'s| is)?\s+(?:on|in)\s+my\s+(?:calendar|schedule|agenda)|my\s+agenda|"
++    r"what\s+(?:do i have|am i doing|have i got)(?:\s+scheduled)?|"
++    r"(?:next|upcoming)\s+(?:class|lecture|meeting|shift|appointment|event)|"
++    r"what(?:'s| is)\s+(?:next|coming up)", re.I)
++_TODO_RE = re.compile(r"\b(?:todo|to-do|to\s*do\s+list|task\s*list|checklist)\b", re.I)
++_BRIEF_RE = re.compile(
++    r"\b(?:good morning|morning brief|daily brief|start my day|what does my day look like|"
++    r"summar(?:ise|ize) my day)\b", re.I)
++
++
++def _rule_calendar(m: re.Match[str], text: str) -> Dict[str, Any]:
++    low = text.lower()
++    if re.search(r"\b(next|upcoming|coming up)\b", low):
++        return _calls(("calendar_next", {}))
++    days = "7" if re.search(r"\bweek\b|coming days", low) else ("2" if "tomorrow" in low else "1")
++    return _calls(("calendar_agenda", {"days": days}))
++
++
++def _rule_todo(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
++    if re.search(r"\b(open|launch|start|close|quit)\b", text, re.I):
++        return None                     # "open the todo app" is a launch, not a list
++    if re.search(r"\b(add|put|write|note)\b", text, re.I):
++        item = re.sub(r"^.*?\b(add|put|write|note)\b\s*", "", text, flags=re.I)
++        item = re.split(r"\s+(?:to|on|in)\s+(?:my\s+)?(?:to ?do|todo|to-do|task list|checklist)",
++                        item, flags=re.I)[0]
++        if item.strip(" .,"):
++            return _calls(("todo", {"action": "add", "text": item.strip(" .,")}))
++    return _calls(("todo", {"action": "list", "text": ""}))
++
++
+ INSTANT_RULES: List[Rule] = [
+     # ---- hands: files, eyes, desktop, time, ears --------------------------
+     ("files-undo", _FILE_UNDO_RE, _rule_files_undo),
+@@ -927,6 +958,9 @@ INSTANT_RULES: List[Rule] = [
+     ("apps-ask", _APPS_ASK_RE, _rule_apps_ask),
+     ("focus-app", _FOCUS_APP_RE, _rule_focus_app),
+     ("listening", _LISTENING_RE, _rule_listening),
++    ("brief", _BRIEF_RE, lambda m, t: _calls(("daily_brief", {}))),
++    ("calendar", _CALENDAR_RE, _rule_calendar),
++    ("todo", _TODO_RE, _rule_todo),
+     ("greeting", _GREETING_RE, _rule_greeting),
+     ("clear", _CLEAR_RE, lambda m, t: {"answer": "Context cleared.", "direct": True, "speak": True, "clear_history": True}),
+     ("stop", _STOP_RE, lambda m, t: {"answer": "Stopped.", "direct": True, "speak": False, "stop_tts": True}),
+@@ -1610,6 +1644,28 @@ def create_app() -> FastAPI:
+     async def api_apps() -> Dict[str, Any]:
+         return await asyncio.to_thread(tools.list_launchable_apps)
+ 
++    @app.get("/api/calendar")
++    async def api_calendar(days: int = 1) -> Dict[str, Any]:
++        """The calendar agenda for the next N days (default today)."""
++        return await asyncio.to_thread(tools.calendar_agenda, str(days))
++
++    @app.get("/api/calendar/next")
++    async def api_calendar_next() -> Dict[str, Any]:
++        return await asyncio.to_thread(tools.calendar_next)
++
++    @app.get("/api/todo")
++    async def api_todo() -> Dict[str, Any]:
++        return await asyncio.to_thread(tools.todo, "list", "")
++
++    @app.post("/api/todo")
++    async def api_todo_post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
++        return await asyncio.to_thread(tools.todo, str(payload.get("action", "list")),
++                                       str(payload.get("text", "")))
++
++    @app.get("/api/brief")
++    async def api_brief() -> Dict[str, Any]:
++        return await asyncio.to_thread(tools.daily_brief)
++
+     # ---------------- WebSocket --------------------------------------------
+     @app.websocket("/ws")
+     async def websocket_endpoint(ws: WebSocket) -> None:
+diff --git a/tools.py b/tools.py
+index 26f88a2..b531257 100644
+--- a/tools.py
++++ b/tools.py
+@@ -1928,6 +1928,225 @@ def llm_status() -> Dict[str, Any]:
+     return {"ok": True, "message": " ".join(lines), "llm": status}
+ 
+ 
++# --------------------------------------------------------------------------- calendar
++def _calendar_module() -> Any:
++    """Import the agenda (calendar) module once (stdlib-only, no heavy deps)."""
++    import agenda as _calendar
++
++    return _calendar
++
++
++def calendar_agenda(days: str = "") -> Dict[str, Any]:
++    """What is on the user's calendar for the next N days (default 1 = today)."""
++    try:
++        cal = _calendar_module()
++    except Exception as exc:  # noqa: BLE001
++        return {"ok": False, "message": f"Calendar module unavailable: {exc}"}
++    try:
++        n = float(days) if (days or "").strip() else 1.0
++    except ValueError:
++        n = 1.0
++    events = cal.agenda(days=max(0.5, min(n, 90.0)))
++    if not events:
++        _, errors = cal.load_events()
++        hint = f" ({errors[0]})" if errors and "configured" in errors[0] else ""
++        return {"ok": True, "message": f"Nothing is scheduled for the next {n:g} day(s).{hint}",
++                "events": [], "count": 0}
++    lines = [f"{e.when}: {e.summary}" + (f" @ {e.location}" if e.location else "")
++             for e in events[:12]]
++    return {"ok": True, "message": " · ".join(lines),
++            "events": [e.as_dict() for e in events[:12]], "count": len(events)}
++
++
++def calendar_next() -> Dict[str, Any]:
++    """The very next calendar event (class, meeting, shift…) whenever it is."""
++    try:
++        cal = _calendar_module()
++    except Exception as exc:  # noqa: BLE001
++        return {"ok": False, "message": f"Calendar module unavailable: {exc}"}
++    event = cal.next_event()
++    if event is None:
++        return {"ok": True, "message": "There is nothing coming up on your calendar.",
++                "event": None}
++    extra = f" at {event.location}" if event.location else ""
++    return {"ok": True,
++            "message": f"Next: {event.summary} — {event.when}{extra}.",
++            "event": event.as_dict()}
++
++
++# --------------------------------------------------------------------------- todo list
++def _todo_path() -> Path:
++    raw = (SETTINGS.todo_file or "notes/todo.md").strip()
++    path = Path(raw)
++    if not path.is_absolute():
++        path = config.ROOT / path
++    return path
++
++
++def _todo_read() -> List[str]:
++    path = _todo_path()
++    if not path.is_file():
++        return []
++    return [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
++            if line.strip()]
++
++
++def todo(action: str = "list", text: str = "") -> Dict[str, Any]:
++    """The everyday to-do list: add items, tick them off, list, clear.  Persisted as Markdown."""
++    action = (action or "list").lower()
++    path = _todo_path()
++    items = _todo_read()
++    try:
++        if action in {"list", "show", "status"}:
++            if not items:
++                return {"ok": True, "message": "Your to-do list is empty.",
++                        "items": [], "count": 0}
++            return {"ok": True, "message": "To-do: " + " | ".join(items[:20]),
++                    "items": items, "count": len(items)}
++        if action in {"add", "new", "append"}:
++            item = (text or "").strip()
++            if not item:
++                return {"ok": False, "message": "Tell me what to add, e.g. 'add to my todo: submit the CBS assignment'."}
++            for existing in items:
++                if existing.lower() == item.lower():
++                    return {"ok": True, "message": f"“{item}” is already on the list.", "items": items}
++            items.append(item)
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text("\n".join(items) + "\n", encoding="utf-8")
++            return {"ok": True, "message": f"Added “{item}” to your to-do list. You have {len(items)} item(s).",
++                    "items": items, "count": len(items)}
++        if action in {"done", "remove", "delete", "complete"}:
++            needle = (text or "").strip().lower()
++            if not needle:
++                return {"ok": False, "message": "Which item? Say 'tick off <the item>'."}
++            kept = [it for it in items if it.lower() != needle]
++            if len(kept) == len(items):
++                return {"ok": False, "message": f"I couldn't find “{text}” on the list.", "items": items}
++            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
++            return {"ok": True, "message": f"Done. “{text}” removed; {len(kept)} item(s) left.",
++                    "items": kept, "count": len(kept)}
++        if action == "clear":
++            path.write_text("", encoding="utf-8")
++            return {"ok": True, "message": "To-do list cleared.", "items": [], "count": 0}
++    except OSError as exc:
++        return {"ok": False, "message": f"Could not update the to-do list: {exc}"}
++    return {"ok": False, "message": f"Unknown todo action “{action}” (list/add/done/clear)."}
++
++
++def daily_brief() -> Dict[str, Any]:
++    """The morning brief: today's date, calendar, to-do list, and pending reminders."""
++    import datetime as _dt
++
++    today_date = _dt.date.today().strftime("%A, %d %B %Y")
++    parts = [f"Here is your brief for {today_date}."]
++
++    try:
++        cal = _calendar_module()
++        todays = cal.agenda(days=1.0)
++        if todays:
++            parts.append("Calendar: " + " · ".join(
++                f"{e.when}: {e.summary}" + (f" @ {e.location}" if e.location else "") for e in todays[:8]))
++        else:
++            parts.append("Calendar: nothing scheduled today.")
++    except Exception as exc:  # noqa: BLE001
++        parts.append(f"Calendar: unavailable ({exc}).")
++
++    items = _todo_read()
++    parts.append("To-do: " + (" | ".join(items[:12]) if items else "nothing on the list."))
++
++    try:
++        if _reminders is not None:
++            rows = _reminders.BOARD.list()
++            if rows:
++                due = "; ".join(f"{str(r.get('text', ''))} at {r.get('due_iso', '?')}" for r in rows[:5])
++                parts.append(f"Reminders: {due}.")
++    except Exception:  # noqa: BLE001
++        pass
++
++    return {"ok": True, "message": " ".join(parts),
++            "date": today_date, "todo": items, "events": todays if 'todays' in dir() else []}
++
++
++# --------------------------------------------------------------------------- email
++def _open_mailto(mailto: str) -> Dict[str, Any]:
++    if config.is_windows():
++        try:
++            import winops as _w
++
++            out = _w.shell_execute(mailto)
++            if out.get("ok"):
++                return {"ok": True, "message": "Opened your mail app with the draft."}
++        except Exception:  # noqa: BLE001
++            pass
++    try:
++        import webbrowser
++
++        if webbrowser.open(mailto):
++            return {"ok": True, "message": "Opened your mail app with the draft."}
++    except Exception:  # noqa: BLE001
++        pass
++    return {"ok": False, "message": f"Your mail app could not be opened. Draft URI: {mailto}"}
++
++
++def _save_draft(to: str, subject: str, body: str) -> Path:
++    folder = config.ROOT / "notes" / "drafts"
++    folder.mkdir(parents=True, exist_ok=True)
++    stamp = time.strftime("%Y%m%d-%H%M%S")
++    path = folder / f"email-{stamp}.md"
++    text = (f"# Email draft ({stamp})\n\n"
++            f"**To:** {to or '(not set)'}\n\n**Subject:** {subject or '(not set)'}\n\n{body or ''}\n")
++    path.write_text(text, encoding="utf-8")
++    return path
++
++
++def draft_email(to: str = "", subject: str = "", body: str = "") -> Dict[str, Any]:
++    """Write an email draft AND open the mail app with it prefilled (no credentials needed)."""
++    to = (to or SETTINGS.email_default_to or "").strip()
++    subject = (subject or "").strip()
++    body = (body or "").strip()
++    if not subject and not body:
++        return {"ok": False, "message": "What should the email say? Give me a subject and a body."}
++    try:
++        path = _save_draft(to, subject, body)
++    except OSError as exc:
++        return {"ok": False, "message": f"Could not save the draft: {exc}"}
++    mailto = ("mailto:" + _urlparse.quote(to or "") + "?subject=" + _urlparse.quote(subject)
++              + "&body=" + _urlparse.quote(body))
++    opened = _open_mailto(mailto)
++    return {"ok": True, "message": f"Draft saved to {path.name} — {opened['message']}",
++            "draft": str(path), "to": to, "subject": subject, "opened": bool(opened.get("ok"))}
++
++
++def send_email(to: str = "", subject: str = "", body: str = "") -> Dict[str, Any]:
++    """Actually SEND an email via the SMTP server configured in .env (falls back to drafting)."""
++    to = (to or SETTINGS.email_default_to or "").strip()
++    subject = (subject or "").strip()
++    body = (body or "").strip()
++    if not to or "@" not in to:
++        return {"ok": False, "message": "I need a real recipient address to send to."}
++    if not (SETTINGS.smtp_host and SETTINGS.smtp_user and SETTINGS.smtp_password):
++        return {"ok": False,
++                "message": ("No SMTP server is configured, so I can't send directly. "
++                            "I'll draft it instead — set SMTP_HOST/SMTP_USER/SMTP_PASSWORD in .env "
++                            "to send for real."),
++                "hint": "draft-created" if (subject or body) else ""}
++    try:
++        import smtplib
++        from email.message import EmailMessage
++
++        msg = EmailMessage()
++        msg["From"] = SETTINGS.email_from or SETTINGS.smtp_user
++        msg["To"] = to
++        msg["Subject"] = subject
++        msg.set_content(body or "")
++        with smtplib.SMTP(SETTINGS.smtp_host, int(SETTINGS.smtp_port), timeout=20) as server:
++            server.starttls()
++            server.login(SETTINGS.smtp_user, SETTINGS.smtp_password)
++            server.send_message(msg)
++        return {"ok": True, "message": f"Email sent to {to}.", "to": to, "subject": subject}
++    except Exception as exc:  # noqa: BLE001 - auth/network must not crash the assistant
++        return {"ok": False, "message": f"Email failed to send: {exc}"}
++
+ 
+ TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
+     "launch_app": launch_app,
+@@ -1953,6 +2172,12 @@ TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
+     "read_screen": read_screen,
+     "set_reminder": set_reminder,
+     "listening": listening,
++    "calendar_agenda": calendar_agenda,
++    "calendar_next": calendar_next,
++    "todo": todo,
++    "daily_brief": daily_brief,
++    "draft_email": draft_email,
++    "send_email": send_email,
+ }
+ 
+ 
+-- 
+2.39.5
+
