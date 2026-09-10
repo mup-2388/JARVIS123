@@ -949,6 +949,30 @@ def _peak_rms(pcm: bytes) -> float:
 # FastAPI wiring
 # ---------------------------------------------------------------------------
 
+async def _learn_models() -> None:
+    """Ask every configured provider what it offers, once, in the background.
+
+    A free tier renaming a model (Groq/Gemini/Cerebras do it every few months) otherwise
+    costs the user the first question of the session as a 404.  Runs off the event loop
+    with the short probe timeout, and never raises: the assistant works with or without it.
+    """
+    import llm_providers
+
+    try:
+        summary = await asyncio.to_thread(llm_providers.POOL.prewarm)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break boot
+        log.debug("provider model discovery skipped: %s", exc)
+        return
+    for key, info in sorted((summary or {}).items()):
+        if info.get("seen"):
+            TERMINAL.push("sys", f"llm {key}: {info['seen']} models visible · "
+                                  f"fast={info['fast']} · smart={info['smart']}")
+        else:
+            TERMINAL.push("warn", f"llm {key}: model list unreadable, will try "
+                                  f"{info.get('fast')} first - if answers fail, run "
+                                  f"`python llm_providers.py` and pin <PROVIDER>_MODEL_FAST in .env")
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -973,6 +997,9 @@ def create_app() -> FastAPI:
         if os.environ.get("JARVIS_WARM", "1") != "0" and SETTINGS.whisper_model:
             voice.warmup()
         TERMINAL.push("sys", f"JARVIS core online · v{VERSION} · Track 1 rules: {len(INSTANT_RULES)} · tools: {len(router.TOOL_NAMES)}")
+        if SETTINGS.llm_auto_discover:
+            # Learn which model ids each key can actually see, before the first question.
+            tasks.append(asyncio.create_task(_learn_models(), name="jarvis-llm-models"))
         log.info(
             "JARVIS %s core ready · HUD at / · WebSocket at /ws · REST /api/* "
             "(the launcher prints the bound port)", VERSION,

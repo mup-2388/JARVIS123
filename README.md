@@ -36,7 +36,7 @@ Markdown notes as a knowledge base, an agentic LLM brain and a Discord bridge.
 | `static/styles.css` | Meters, sparklines, terminal, pills, animations, scrollbar, webview chrome |
 | `static/arc_reactor.js` | WebGL render loop **and** the HUD client (WebSocket, telemetry, terminal, mic, cards) |
 | `notes/*.md` | Your study notes, read by `read_notes()` (German A2 + CS prep included as worked examples) |
-| `tests/test_jarvis.py` | 103 stdlib-unittest checks: schemas, regex precision, provider failover, notes scoring, VAD, REST |
+| `tests/test_jarvis.py` | 110 stdlib-unittest checks: schemas, regex precision, provider failover, notes scoring, VAD, REST |
 
 ## 2 · Setup (Windows)
 
@@ -121,9 +121,18 @@ JSON-in-prompt path, and `CUSTOM_LLM_RESET` tells the cooldown maths how its quo
    of the minute for an RPM/TPM throttle, otherwise until its daily reset (UTC, or
    Pacific for Gemini), capped by `LLM_COOLDOWN_HOURS=24`. Cooldowns are written to
    `data/llm_state.json`, so restarting JARVIS does not re-burn a limited key.
-4. A `404` naming a model marks *that model* bad for 6 h and retries the provider's
-   other model — free-tier model ids get retired often. A `401/402/403` exiles the
-   provider (bad key/plan) rather than retrying it every utterance.
+4. **Model ids are self-healing.** Free tiers rename and retire models, and a brand-new key
+   is not always entitled to the flagship, so "The model `x` does not exist or you do not
+   have access to it" is routine. A refused id is parked for 6 h (persisted, so a restart
+   does not re-learn it), the *next* model on that provider's ladder is tried **in the same
+   turn**, and once per provider JARVIS reads `GET /models` to see which ids the key can
+   actually see and pins those (`LLM_AUTO_DISCOVER=true`, on by default, re-read at boot).
+   If every id a provider offers is refused, that provider backs off for 10 minutes and
+   says so — with `python llm_providers.py` as the one command that lists what each key
+   sees, what will be sent, and probes them all. Pin ids yourself with
+   `<KEY>_MODEL_FAST` / `<KEY>_MODEL_SMART` and discovery stops bothering with that
+   provider. A `401/402/403` still exiles the provider (bad key or plan) instead of
+   cycling models.
 5. Two consecutive DNS/TLS failures rest the whole pool for
    `LLM_OFFLINE_COOLDOWN_SECONDS`, and one turn never spends more than
    `LLM_BUDGET_SECONDS` walking providers — a frozen mic is worse than a heuristic answer.
@@ -131,8 +140,10 @@ JSON-in-prompt path, and `CUSTOM_LLM_RESET` tells the cooldown maths how its quo
 **Watch it happen.** The HUD's **AI providers** panel lists every provider with
 `● ready / ▲ cooling / ○ no key`, the model it will use, its latency average and how
 long a cooldown has left; the header pill shows which brain answered the last
-command (`groq:llama-3.1-8b-instant` vs `local-regex-planner`). Buttons: **reset**
-clears cooldowns, **probe** pings each configured key with a one-word prompt.
+command (`groq:llama-3.1-8b-instant` vs `local-regex-planner`). Hover a provider to see
+how many models your key can actually list, which ids were refused, and what JARVIS
+switched to. Buttons: **reset** clears cooldowns and the learned model list, **probe**
+pings each configured key with a one-word prompt (and returns its visible model ids).
 
 ```bat
 curl http://127.0.0.1:8760/api/llm                                       :: who is ready / cooling and why
@@ -195,7 +206,7 @@ Outbound: `hello`, `telemetry`, `log`, `state`, `reply`, `card`, `transcript`, `
 ## 6 · Verification
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover -s tests -v     # 103 cases, all offline
+.venv\Scripts\python.exe -m unittest discover -s tests -v     # 110 cases, all offline
 .venv\Scripts\python.exe -c "import router,json;print(json.dumps(router.TOOL_SCHEMAS[0],indent=2))"
 .venv\Scripts\python.exe -c "import llm_providers as l;print(l.POOL.configured() or 'NO KEYS');print(l.choose_tier('open steam'), l.choose_tier('compare the dative and accusative cases, then write a study plan'))"
 curl http://127.0.0.1:8760/api/telemetry
@@ -223,6 +234,7 @@ curl -X POST http://127.0.0.1:8760/api/command -H "Content-Type: application/jso
 | Answers come back as DuckDuckGo links for a conceptual question | that only happens when no provider answered **and** the question looks like it needs live data. `LLM_FALLBACK_SEARCH=false` turns it off entirely |
 | `Groq: 429` every few minutes but no failover | the next provider in `LLM_PROVIDER_ORDER` needs a key too; rotation only skips to *configured* providers |
 | `Cloudflare: 404 … check CLOUDFLARE_ACCOUNT_ID` | the token is fine but the account id is wrong (it is in the dashboard URL) or lacks *Workers AI: Read & Write* |
-| A model id 404s (Cerebras retired some in Feb 2026) | that model is parked for 6 h and the provider's other model is used; pin a working one with `CEREBRAS_MODEL_FAST=…` / `…_MODEL_SMART=…` |
+| "Every AI provider is busy… `The model X does not exist or you do not have access to it`" | the catalogue id is retired or your key lacks it. JARVIS now retries the provider's other models in the same turn and pins an id your key really has (`/models`), so this is usually self-inflicted only if you disabled `LLM_AUTO_DISCOVER`. Run `python llm_providers.py` to see the list, then pin `GROQ_MODEL_FAST=…` / `GROQ_MODEL_SMART=…` in `.env` |
+| Only ever answers with the small model, never the 70B | your key has no access to it; that is the correct fallback. `curl http://127.0.0.1:8760/api/llm` shows `model_ids` and `rejected_models` per provider |
 | First answer after boot takes ~30 s | a key is set but unreachable (proxy/AV blocking TLS): JARVIS walks the pool until `LLM_BUDGET_SECONDS`, then answers with the planner. Remove the dead key from `.env` |
 | Volume/power did nothing | PowerShell blocked: run `powershell -Command "Get-ExecutionPolicy"`; allow `RemoteSigned` for the user |

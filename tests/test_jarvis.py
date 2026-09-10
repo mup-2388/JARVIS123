@@ -1023,6 +1023,139 @@ class TestHudMarkup(unittest.TestCase):
 
 
 
+class TestModelFallback(unittest.TestCase):
+    """A retired or not-entitled model id must never cost the user the answer."""
+
+    VISIBLE = ("llama-3.1-8b-instant", "llama-guard-4-12b", "whisper-large-v3-turbo",
+               "playai-tts Array", "meta-llama/llama-4-scout-17b-16e-instruct",
+               "gpt-oss-120b", "qwen/qwen3-32b", "text-embedding-3-small")
+
+    def setUp(self):
+        import llm_providers as lp
+
+        self.lp = lp
+        self._dir = tempfile.mkdtemp(prefix="jarvis-model-")
+        self.state = Path(self._dir) / "llm.json"
+        self.pool = lp.LlmPool(state_file=self.state)
+        self._post, self._get = lp._post_json, lp._get_json
+        self._real_pool = lp.POOL
+        lp.POOL = self.pool
+        self._env = {}
+        for name in ("GROQ_API_KEY", "CEREBRAS_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY",
+                     "OPENROUTER_API_KEY", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+                     "GITHUB_MODELS_TOKEN", "CUSTOM_LLM_BASE_URL", "LLM_AUTO_DISCOVER"):
+            self._env[name] = os.environ.get(name)
+        os.environ["GROQ_API_KEY"] = "gsk-test"
+        for name in self._env:
+            if name != "GROQ_API_KEY":
+                os.environ.pop(name, None)
+        # discovery is on by default; keep it deterministic and offline
+        self.list_calls = []
+        lp._get_json = self._fake_get
+
+    def tearDown(self):
+        for name, value in self._env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.lp._post_json, self.lp._get_json = self._post, self._get
+        self.lp.POOL = self._real_pool
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _fake_get(self, url, headers, timeout):
+        self.list_calls.append(url)
+        return 200, {}, {"data": [{"id": i} for i in self.VISIBLE]}
+
+    def _fake_post(self, ok_models, status=404, message="The model `%s` does not exist or you do not have access to it."):
+        sent = []
+
+        def post(url, headers, payload, timeout):
+            model = payload.get("model", "")
+            sent.append(model)
+            if model in ok_models:
+                return 200, {}, {"choices": [{"finish_reason": "stop",
+                                               "message": {"role": "assistant", "content": f"answered by {model}"}}]}
+            return status, {}, {"error": {"message": message % model}}
+
+        self.lp._post_json = post
+        return sent
+
+    def test_refused_model_is_replaced_inside_the_same_turn(self):
+        # Groq's advertised smart model 404s on this account, exactly the reported failure
+        sent = self._fake_post({"llama-3.1-8b-instant"})
+        out = self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
+        self.assertEqual(out["content"], "answered by llama-3.1-8b-instant")
+        self.assertTrue(out["model_switched"], "the caller must be able to see that a swap happened")
+        self.assertEqual(sent.count("llama-3.3-70b-versatile"), 1,
+                         "a refused model must not be hammered twice in one turn")
+        self.assertNotEqual(self.pool.model_for("groq", "smart"), "llama-3.3-70b-versatile")
+
+    def test_discovery_reads_the_key_list_once_and_ignores_non_chat_models(self):
+        self._fake_post({"llama-3.1-8b-instant"})
+        self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
+        found = self.pool._health_for("groq")["discovered"]      # noqa: SLF001
+        self.assertEqual(len(self.list_calls), 1, "one /models read per TTL, not one per turn")
+        self.assertEqual(found["fast"], "llama-3.1-8b-instant")
+        self.assertEqual(found["smart"], "gpt-oss-120b", "biggest real chat model, not the 17B multimodal")
+        for junk in ("whisper", "guard", "embedding", "playai-tts"):
+            self.assertNotIn(junk, found["fast"] + found["smart"])
+            self.assertNotIn(junk, self.pool.model_for("groq", "smart"))
+        self.pool.complete([{"role": "user", "content": "again"}], tier="fast")
+        self.assertEqual(len(self.list_calls), 1, "the answer is cached")
+
+    def test_parking_survives_a_restart(self):
+        self._fake_post(set())
+        with self.assertRaises(self.lp.LlmError):
+            self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
+        reloaded = self.lp.LlmPool(state_file=self.state)
+        self.assertNotEqual(reloaded.model_for("groq", "smart"), "llama-3.3-70b-versatile",
+                            "a restart must not spend the first turn on a known-dead id")
+        self.assertTrue(reloaded.status()["providers"][0]["rejected_models"])
+
+    def test_all_models_refused_backs_off_with_an_actionable_message(self):
+        self._fake_post(set())
+        with self.assertRaises(self.lp.LlmError) as caught:
+            self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
+        cooling, left, reason = self.pool.cooling("groq")
+        self.assertTrue(cooling and left > 60, f"expected a ~10 minute back-off, got {left}s")
+        self.assertIn("llm_providers.py", reason)
+        self.assertIn("MODEL_FAST", reason)
+        tried = [a.get("model") for a in (caught.exception.attempts or []) if a.get("model_problem")]
+        self.assertGreaterEqual(len(tried), 2, "the whole ladder is walked before giving up")
+        self.assertEqual(len(tried), len(set(tried)), "no model is asked for twice in one turn")
+
+    def test_auth_failure_does_not_cycle_models(self):
+        sent = self._fake_post(set(), status=403, message="Your account does not have access to %s")
+        with self.assertRaises(self.lp.LlmError):
+            self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
+        self.assertTrue(self.pool.cooling("groq")[0], "403 is a plan/key problem: exile the provider")
+        self.assertEqual(len(sent), 1, "no point trying four models against a permission wall")
+
+    def test_prewarm_reports_visibility_without_raising(self):
+        summary = self.pool.prewarm()
+        self.assertIn("groq", summary)
+        self.assertEqual(summary["groq"]["seen"], len(self.VISIBLE))
+        self.assertTrue(summary["groq"]["fast"] and summary["groq"]["smart"])
+
+        def broken(url, headers, timeout):
+            raise ConnectionError("no route")
+
+        self.lp._get_json = broken
+        fresh = self.lp.LlmPool(state_file=Path(self._dir) / "other.json")
+        quiet = fresh.prewarm()
+        self.assertEqual(quiet["groq"]["seen"], 0, "an unreadable list must be silent, not fatal")
+
+    def test_status_shows_what_the_key_can_see(self):
+        self._fake_post({"llama-3.1-8b-instant"})
+        self.pool.complete([{"role": "user", "content": "hi"}], tier="smart")
+        provider = self.pool.status()["providers"][0]
+        self.assertEqual(provider["models_seen"], len(self.VISIBLE))
+        self.assertIn("llama-guard-4-12b", provider["model_ids"], "the raw list is exposed for the HUD")
+        self.assertIn("llama-3.3-70b-versatile", provider["rejected_models"])
+
+
+
 class TestWindowBootstrap(unittest.TestCase):
     """pywebview's load event is an object subscribed to with ``+=``, not a decorator."""
 

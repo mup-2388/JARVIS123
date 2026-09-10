@@ -694,6 +694,10 @@ function providerRow(p, brain) {
     `${p.key} · ${model || 'no model'}`,
     p.quota ? `free tier: ${p.quota}` : '',
     p.reason ? `last problem: ${p.reason}` : '',
+    p.models_seen ? `${p.models_seen} models visible to this key` : '',
+    (p.discovered && p.discovered.smart && p.discovered.smart !== p.model)
+      ? `catalogue id refused; using ${p.discovered.fast || ''} / ${p.discovered.smart}` : '',
+    (p.rejected_models && p.rejected_models.length) ? `refused: ${p.rejected_models.join(', ')}` : '',
     `reset window: ${p.reset || '—'}`,
     p.key_set ? '' : `set ${p.key_env} in .env  (${p.key_url || 'get a key'})`,
     p.needs_account && !p.account_set ? `also set ${p.account_env}` : '',

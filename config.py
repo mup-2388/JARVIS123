@@ -138,6 +138,10 @@ class Settings:
     #: fact-shaped questions?  True keeps JARVIS useful; false makes it say "no AI".
     llm_fallback_search: bool = field(default_factory=lambda: _coerce_bool(dotenv("LLM_FALLBACK_SEARCH"), True))
     llm_probe_timeout: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_PROBE_TIMEOUT_SECONDS"), 12))
+    # Ask each provider's /models endpoint which ids the key can see, then use those.
+    # Free tiers rename and retire models constantly; this is what stops a retired id
+    # such as "llama-3.3-70b-versatile" costing the user every answer.
+    llm_auto_discover: bool = field(default_factory=lambda: _coerce_bool(dotenv("LLM_AUTO_DISCOVER"), True))
     #: Hard wall-clock ceiling for one "ask the AI" turn across *all* providers.
     #: Better a heuristic answer in 25 s than a frozen mic for 3 minutes.
     llm_budget_seconds: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_BUDGET_SECONDS"), 25))

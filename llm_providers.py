@@ -61,7 +61,17 @@ log = get_logger("llm")
 
 #: Everything the router needs to know about a failed round trip.
 MINUTE_WINDOW_SECONDS = 65          # RPM / TPM throttles
-MODEL_NOT_FOUND_SECONDS = 6 * 3600  # a retired model id will not come back within the hour
+MODEL_NOT_FOUND_SECONDS = 6 * 3600
+DISCOVER_TTL_SECONDS = 6 * 3600        # how long a /models answer is trusted
+# Models that exist on these endpoints but cannot carry a conversation.
+_MODEL_BANNED = re.compile(
+    r"embed|embedding|whisper|tts|audio|image|vision|-vl|clip|dall|sora|guard|safety"
+    r"|moderation|rerank|transcri|realtime|live|computer[-_ ]?use|translate|search-|rank"
+    r"|playai|dolphin|mytho|assistant-|prompt-|-zh|il|text-bison", re.I)
+_MODEL_CHAT = re.compile(
+    r"instruct|chat|instant|versatile|model|llama|gemini|gpt|qwen|mistral|mixtral|deepseek"
+    r"|phi|gemma|glm|kimi|magistral|devstral|scout|maverick|oss|command|nova|minimax", re.I)
+_MODEL_FAST_NAME = re.compile(r"instant|flash[-_ ]?lite|lite|mini|small|nano|tiny|turbo|8b|7b|3b|4b", re.I)  # a retired model id will not come back within the hour
 TRANSIENT_BASE_SECONDS = 120        # 5xx / timeouts, doubled per consecutive failure
 TRANSIENT_CAP_SECONDS = 30 * 60
 
@@ -397,6 +407,50 @@ def looks_like_research(text: str) -> bool:
 # HTTP seam (single function so tests never touch the network)
 # ---------------------------------------------------------------------------
 
+def _get_json(url: str, headers: Dict[str, str], timeout: float) -> Tuple[int, Dict[str, str], Any]:
+    """GET JSON (only ``/models`` discovery uses it) - the second and last network seam."""
+    request = urllib.request.Request(url, method="GET")
+    for name, value in headers.items():
+        request.add_header(name, value)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            raw = response.read().decode("utf-8", "replace")
+            return response.status, {k.lower(): v for k, v in dict(response.headers).items()}, _loads(raw)
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            raw = ""
+        return exc.code, {k.lower(): v for k, v in dict(exc.headers or {}).items()}, _loads(raw)
+    except urllib.error.URLError as exc:
+        raise ConnectionError(f"network error: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise ConnectionError("request timed out") from exc
+
+
+def _model_size(model: str) -> float:
+    """Parameter count in billions from a model id (``llama-3.3-70b-versatile`` -> 70)."""
+    found = [float(m.group(1)) for m in re.finditer(r"(\d+(?:\.\d+)?)\s*b\b", model.lower())]
+    return found[-1] if found else 0.0
+
+
+def _pick_models(ids: List[str]) -> Tuple[str, str]:
+    """Choose (fast, smart) from the model ids one key can actually see."""
+    usable = [i for i in dict.fromkeys(ids) if i and not _MODEL_BANNED.search(i)]
+    chat = [i for i in usable if _MODEL_CHAT.search(i)] or usable
+    if not chat:
+        return "", ""
+    sized = {i: _model_size(i) for i in chat}
+    sweet = [i for i in chat if 2.0 <= sized[i] <= 14.0] or chat
+    fast = min(sweet, key=lambda i: (0 if _MODEL_FAST_NAME.search(i) else 1, sized[i] or 999))
+    big = [i for i in chat if sized[i] >= 20.0]
+    if big:
+        smart = max(big, key=lambda i: (sized[i], 1 if re.search(r"70b|120b|405b|large|plus|flash|scout|pro", i, re.I) else 0))
+    else:
+        smart = max(chat, key=lambda i: (0 if _MODEL_FAST_NAME.search(i) else 1, sized[i]))
+    return fast, (smart if smart != fast else fast)
+
+
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float) -> Tuple[int, Dict[str, str], Any]:
     """POST JSON, return ``(status, response_headers, decoded_body_or_raw_text)``."""
     data = json.dumps(payload).encode("utf-8")
@@ -567,14 +621,120 @@ class LlmPool:
         return bool(self.available())
 
     def model_for(self, key: str, tier: str) -> str:
+        """Which model id to send this provider right now.
+
+        The catalogue ids in ``PROVIDERS`` are what the vendor advertised when this file
+        was written; free tiers rename them constantly and a fresh key is not always
+        entitled to the flagship.  So the ranking is: the configured id for this tier, the
+        id ``/models`` says this key can see, the provider's other tier - skipping any id
+        the key has already rejected with a 404.
+        """
         spec = PROVIDERS[key]
-        model = spec.smart_model if tier == "smart" else spec.fast_model
+        configured = spec.smart_model if tier == "smart" else spec.fast_model
         health = self._health_for(key)
+        found = health.get("discovered") or {}
         bad = health.get("bad_models") or {}
-        alt = spec.fast_model if model == spec.smart_model else spec.smart_model
-        if bad.get(model, 0) > time.time() and alt and alt != model:
-            return alt
-        return model
+        listed = set(found.get("ids") or [])
+        other_tier = found.get("fast" if tier == "smart" else "smart") or ""
+        for candidate in (configured, found.get(tier) or "", other_tier):
+            if not candidate:
+                continue
+            if bad.get(candidate, 0) > time.time():
+                continue
+            if listed and candidate not in listed:
+                log.debug("%s: %s is not in this key's model list", spec.label, candidate)
+                continue
+            return candidate
+        alt = spec.fast_model if configured == spec.smart_model else spec.smart_model
+        return alt or configured
+
+    def models_to_try(self, key: str, tier: str) -> List[str]:
+        """The model ladder for one provider inside a single turn."""
+        spec = PROVIDERS[key]
+        health = self._health_for(key)
+        found = health.get("discovered") or {}
+        bad = health.get("bad_models") or {}
+        wanted = spec.smart_model if tier == "smart" else spec.fast_model
+        other = spec.fast_model if tier == "smart" else spec.smart_model
+        ladder = [self.model_for(key, tier), other,
+                  found.get(tier) or "", found.get("fast" if tier == "smart" else "smart") or "",
+                  found.get("fast") or "", found.get("smart") or "", wanted]
+        out: List[str] = []
+        for model in ladder:
+            model = (model or "").strip()
+            if model and model not in out:
+                out.append(model)
+        # A model the key already rejected goes last instead of being dropped: if it is
+        # the only one the account can see, it is still the only thing worth trying.
+        out.sort(key=lambda m: 1 if bad.get(m, 0) > time.time() else 0)
+        return out
+
+    def prewarm(self) -> Dict[str, Any]:
+        """Read every configured provider's model list once, at start-up.
+
+        Cheap (one small GET each, bounded by LLM_PROBE_TIMEOUT_SECONDS) and it means the
+        first utterance of the day is answered with a model this key really has, instead
+        of spending a turn discovering that a free-tier id was renamed.
+        """
+        summary: Dict[str, Any] = {}
+        for key in self.configured():
+            try:
+                found = self.discover(key) or {}
+            except Exception as exc:  # noqa: BLE001 - boot must not fail on a diagnostic
+                log.debug("model discovery skipped for %s: %s", key, exc)
+                found = {}
+            summary[key] = {"seen": int(found.get("count", 0) or 0),
+                            "fast": self.model_for(key, "fast"),
+                            "smart": self.model_for(key, "smart")}
+        return summary
+
+    def discover(self, key: str, *, force: bool = False) -> Dict[str, Any]:
+        """Ask a provider which models this key can use, and remember the answer.
+
+        Cheaper than guessing: one GET against the OpenAI-compatible ``/models`` list
+        turns "the model does not exist" from a failed turn into a working model id, and
+        it also tells the HUD what is really being used.  Cached for 6 hours (and in
+        ``data/llm_state.json``), skipped for endpoints that do not expose it.
+        """
+        spec = PROVIDERS[key]
+        health = self._health_for(key)
+        cached = health.get("discovered") or {}
+        if not force and cached.get("ids") and time.time() - float(cached.get("at", 0)) < DISCOVER_TTL_SECONDS:
+            return cached
+        if spec.style != "openai" or not spec.root:
+            return cached          # Cloudflare's /ai/run has no compatible list endpoint
+        try:
+            status, _headers, body = _get_json(spec.root + "/models", self._headers(spec),
+                                               SETTINGS.llm_probe_timeout)
+        except Exception as exc:  # noqa: BLE001 - discovery is a bonus, never fatal
+            log.debug("model discovery for %s failed: %s", spec.label, exc)
+            return cached
+        rows: Any = []
+        if isinstance(body, dict):
+            rows = body.get("data") or body.get("models") or body.get("result") or body.get("object") or []
+        elif isinstance(body, list):
+            rows = body
+        ids: List[str] = []
+        for row in rows if isinstance(rows, list) else []:
+            if isinstance(row, str):
+                ids.append(row)
+            elif isinstance(row, dict):
+                value = row.get("id") or row.get("name") or row.get("model_name") or ""
+                if value:
+                    ids.append(str(value))
+        ids = [i[len("models/"):] if i.startswith("models/") else i for i in dict.fromkeys(ids)]
+        fast, smart = _pick_models(ids)
+        picked = {"at": int(time.time()), "count": len(ids), "ids": ids[:200],
+                  "fast": fast, "smart": smart or fast,
+                  "reason": "" if ids else f"HTTP {status}: no model list"}
+        with self._lock:
+            health["discovered"] = picked
+        self._save_state()
+        if ids:
+            log.info("%s: key sees %d models (fast=%s, smart=%s)", spec.label, len(ids), fast or "?", smart or "?")
+        else:
+            log.warning("%s: could not read the model list (HTTP %s)", spec.label, status)
+        return picked
 
     # -- requests ----------------------------------------------------------
     def complete(
@@ -626,59 +786,98 @@ class LlmPool:
                 if pass_no == 1 and not (cooling and left <= 300):
                     continue
                 spec = PROVIDERS[key]
-                model = self.model_for(key, tier)
-                if (key, model) in tried_realms:
-                    continue
-                tried_realms.add((key, model))
-                use_tools = bool(tools) and spec.supports_tools
-                for attempt_no in range(2):          # 2nd pass: retry without native tools
-                    started = time.perf_counter()
-                    try:
-                        payload = self._payload(spec, model, messages,
-                                                 tools=tools if use_tools else None,
-                                                 json_mode=json_mode, max_tokens=max_tokens, temperature=temperature)
-                        url = spec.endpoint(model)
-                        if spec.style == "cloudflare" or (spec.key == "cloudflare" and attempt_no == 1):
-                            url, payload = self._cloudflare_native(spec, model, messages, max_tokens, temperature)
-                        status, headers, body = _post_json(url, self._headers(spec), payload, SETTINGS.llm_timeout)
-                    except (ConnectionError, OSError, ValueError) as exc:
+                # A provider gets a whole LADDER of model ids in this one turn: its tier
+                # model, its other model, and whatever /models says the key can see. A
+                # retired or not-entitled id must never cost the user the answer.
+                ladder = self.models_to_try(key, tier)
+                cursor = 0
+                discovered_here = False
+                give_up = False
+                while cursor < len(ladder) and not give_up:
+                    model = ladder[cursor]
+                    cursor += 1
+                    if not model or (key, model) in tried_realms:
+                        continue
+                    tried_realms.add((key, model))
+                    use_tools = bool(tools) and spec.supports_tools
+                    for attempt_no in range(2):          # 2nd pass: retry without native tools
+                        started = time.perf_counter()
+                        try:
+                            payload = self._payload(spec, model, messages,
+                                                     tools=tools if use_tools else None,
+                                                     json_mode=json_mode, max_tokens=max_tokens, temperature=temperature)
+                            url = spec.endpoint(model)
+                            if spec.style == "cloudflare" or (spec.key == "cloudflare" and attempt_no == 1):
+                                url, payload = self._cloudflare_native(spec, model, messages, max_tokens, temperature)
+                            status, headers, body = _post_json(url, self._headers(spec), payload, SETTINGS.llm_timeout)
+                        except (ConnectionError, OSError, ValueError) as exc:
+                            ms = int((time.perf_counter() - started) * 1000)
+                            network_failures += 1
+                            self._penalise(key, "network", str(exc)[:180], SETTINGS.llm_offline_cooldown)
+                            attempts.append({"provider": key, "model": model, "error": str(exc)[:180], "latency_ms": ms})
+                            first_error = first_error or f"{spec.label}: {exc}"
+                            give_up = True               # this network is down, not this model
+                            break
                         ms = int((time.perf_counter() - started) * 1000)
-                        network_failures += 1
-                        self._penalise(key, "network", str(exc)[:180], SETTINGS.llm_offline_cooldown)
-                        attempts.append({"provider": key, "model": model, "error": str(exc)[:180], "latency_ms": ms})
-                        first_error = first_error or f"{spec.label}: {exc}"
-                        break                           # provider-level: no point retrying sans tools
-                    ms = int((time.perf_counter() - started) * 1000)
-                    if status == 200:
-                        parsed = self._parse(body, ms, spec, model)
-                        self._reward(key, ms)
-                        self.calls += 1
-                        self.total_ms += ms
-                        self.last_provider = key
-                        self.tier_used[tier if tier in self.tier_used else "fast"] += 1
-                        self.last_tier = tier if tier in self.tier_used else "fast"
-                        parsed["attempts"] = attempts
-                        return parsed
-                    message = _quota_text(body)
-                    if _model_not_found(body) or (status == 404 and attempt_no == 0):
-                        self._mark_model_bad(key, model, message)
-                        if self.model_for(key, tier) != model:
-                            break                       # retry this provider with its other model
-                    if status == 404 and spec.account_env:
-                        # A 404 on the account path is never about the model: the account id
-                        # is wrong or the token has no Workers AI permission.
-                        self._penalise(key, "account",
-                                       "404 from Cloudflare - check CLOUDFLARE_ACCOUNT_ID and that the "
-                                       "token has Workers AI: Read & Write")
-                        continue
-                    if status in (400, 422) and use_tools and attempt_no == 0:
-                        use_tools = False               # hub rejected native tools: ask for JSON instead
-                        continue
-                    self._penalise_http(key, status, headers, message)
-                    attempts.append({"provider": key, "model": model, "status": status,
-                                     "error": message or f"HTTP {status}", "latency_ms": ms})
-                    first_error = first_error or f"{spec.label} HTTP {status}: {message[:160]}"
-                    break
+                        if status == 200:
+                            parsed = self._parse(body, ms, spec, model)
+                            self._reward(key, ms)
+                            self.calls += 1
+                            self.total_ms += ms
+                            self.last_provider = key
+                            self.tier_used[tier if tier in self.tier_used else "fast"] += 1
+                            self.last_tier = tier if tier in self.tier_used else "fast"
+                            parsed["attempts"] = attempts
+                            parsed["model_switched"] = model != ladder[0]
+                            return parsed
+                        message = _quota_text(body)
+                        if status == 404 and spec.account_env and not _model_not_found(body):
+                            # A 404 on the account path is not about the model: wrong
+                            # CLOUDFLARE_ACCOUNT_ID, or a token without Workers AI access.
+                            self._penalise(key, "account",
+                                           "404 from Cloudflare - check CLOUDFLARE_ACCOUNT_ID and that the "
+                                           "token has Workers AI: Read & Write")
+                            give_up = True
+                            break
+                        if _model_not_found(body) or status == 404 or (status in (400, 408) and attempt_no == 1):
+                            # Model-shaped failure: park this id, then try the next rung of
+                            # the ladder - and once, ask the endpoint what it does offer.
+                            self._mark_model_bad(key, model, message)
+                            attempts.append({"provider": key, "model": model, "status": status,
+                                             "error": message or f"HTTP {status} (model unavailable)",
+                                             "latency_ms": ms, "model_problem": True})
+                            first_error = first_error or f"{spec.label} HTTP {status}: {message[:160]}"
+                            if SETTINGS.llm_auto_discover and not discovered_here:
+                                discovered_here = True
+                                if (self.discover(key) or {}).get("ids"):
+                                    # Rebuild the ladder from what the key can actually see,
+                                    # then walk it from the top: tried_realms still guards
+                                    # the ids this turn already burned, so nothing repeats.
+                                    rest = [m for m in ladder[cursor:] if (key, m) not in tried_realms]
+                                    ladder = [m for m in self.models_to_try(key, tier) if m not in rest] + rest
+                                    cursor = 0
+                            break           # next rung of the ladder, not another round of this one
+                        if status in (400, 422) and use_tools and attempt_no == 0:
+                            use_tools = False               # hub rejected native tools: JSON instead
+                            continue
+                        self._penalise_http(key, status, headers, message)
+                        attempts.append({"provider": key, "model": model, "status": status,
+                                         "error": message or f"HTTP {status}", "latency_ms": ms})
+                        first_error = first_error or f"{spec.label} HTTP {status}: {message[:160]}"
+                        give_up = True                      # quota/auth: another model will not help
+                        break
+                    if give_up:
+                        break
+                if give_up:
+                    continue                      # auth/quota/network: already penalised
+                mine = [a for a in attempts if a.get("provider") == key]
+                if mine and all(a.get("model_problem") for a in mine):
+                    # Every model id this provider offers was refused: back off briefly
+                    # instead of burning a fresh turn on the same dead end each utterance.
+                    self._penalise(key, "model",
+                                   "no model id on this key worked - run `python llm_providers.py` "
+                                   "to see what it can use, or set "
+                                   f"{key.upper()}_MODEL_FAST / {key.upper()}_MODEL_SMART in .env", 600)
         self.failures += 1
         self.last_error = first_error or "every configured provider failed"
         self._save_state()
@@ -809,9 +1008,16 @@ class LlmPool:
             for name in (model, *[m for m in (PROVIDERS[key].fast_model, PROVIDERS[key].smart_model) if m and m in (message or "")]):
                 bad[name] = time.time() + MODEL_NOT_FOUND_SECONDS
             health["bad_models"] = bad
+        # Persisted, so a restart does not spend the next turn re-discovering that this
+        # key cannot use that id (that repeat was the whole complaint this fixes).
+        self._save_state()
 
     def reset(self, key: str = "") -> Dict[str, Any]:
-        """Drop cooldowns (all, or one provider) -- what ``/api/llm/reset`` calls."""
+        """Drop cooldowns and learned model lists (all, or one provider).
+
+        ``/api/llm/reset`` calls this, which is exactly what you want after swapping a
+        key in ``.env``: the old key's rejections and model list go with it.
+        """
         with self._lock:
             keys = [key] if key else list(self._health)
             for name in keys:
@@ -849,7 +1055,14 @@ class LlmPool:
                  "cool_left_s": self.cooling(key)[1],
                  "reason": health_reason(self._health_for(key)),
                  "ok": int(self._health_for(key).get("ok", 0) or 0),
-                 "avg_ms": int(self._health_for(key).get("ms", 0) or 0)}
+                 "avg_ms": int(self._health_for(key).get("ms", 0) or 0),
+                 # what /models discovery learned about this key, and which ids it refused
+                 "models_seen": int((self._health_for(key).get("discovered") or {}).get("count", 0) or 0),
+                 "discovered": {k: v for k, v in (self._health_for(key).get("discovered") or {}).items()
+                                if k in ("fast", "smart", "count", "at", "reason")},
+                 "model_ids": list((self._health_for(key).get("discovered") or {}).get("ids") or [])[:16],
+                 "rejected_models": sorted(m for m, until in (self._health_for(key).get("bad_models") or {}).items()
+                                           if float(until or 0) > time.time())}
                 for key in order()
             ],
         }
@@ -866,11 +1079,16 @@ class LlmPool:
                                       [{"role": "user", "content": "Reply with exactly: OK"}],
                                       max_tokens=6, temperature=0.0)
                 results[key] = {"ok": True, "model": self.model_for(key, "fast"),
+                                "smart_model": self.model_for(key, "smart"),
                                 "reply": parsed["content"][:24],
                                 "latency_ms": int((time.perf_counter() - started) * 1000)}
             except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
                 results[key] = {"ok": False, "error": str(exc)[:200],
+                                "model": self.model_for(key, "fast"),
                                 "latency_ms": int((time.perf_counter() - started) * 1000)}
+            seen = (self._health_for(key).get("discovered") or {})
+            if seen.get("ids"):
+                results[key]["models_available"] = list(seen["ids"])[:20]
         return {"ok": any(v.get("ok") for v in results.values()), "providers": results}
 
     def _single(self, spec: ProviderSpec, model: str, messages: List[Dict[str, Any]],
@@ -939,3 +1157,75 @@ def reset(key: str = "") -> Dict[str, Any]:
 
 def probe() -> Dict[str, Any]:
     return POOL.probe()
+
+
+# ---------------------------------------------------------------------------
+# ``python llm_providers.py`` -- the "why did JARVIS say no provider answered" tool
+# ---------------------------------------------------------------------------
+
+def _cli(argv: Optional[List[str]] = None) -> int:  # pragma: no cover - manual diagnostic
+    """Print what each configured key can see and use.  No third-party imports."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="JARVIS AI provider diagnostic")
+    parser.add_argument("--no-list", action="store_true", help="skip the /models discovery call")
+    parser.add_argument("--ask", default="", help="also send this prompt to the pool")
+    args = parser.parse_args(argv)
+
+    print("JARVIS AI providers")
+    print(f"  order          : {' -> '.join(order())}")
+    print(f"  tier mode      : {SETTINGS.llm_tier_mode}   auto-discover: {SETTINGS.llm_auto_discover}")
+    print(f"  timeout/budget : {SETTINGS.llm_timeout}s per request, {SETTINGS.llm_budget_seconds}s per turn")
+    print(f"  cooldown cap   : {SETTINGS.llm_cooldown_hours}h   state: {POOL.state_file}")
+    print(f"  keys in .env   : {', '.join(POOL.configured()) or 'NONE - add one to .env'}")
+    code = 1
+    for key in POOL.configured():
+        spec = PROVIDERS[key]
+        cooling, left, reason = POOL.cooling(key)
+        print(f"\n  [{key}] {spec.label}")
+        print(f"    endpoint     : {spec.root}")
+        print(f"    catalogue ids: fast={spec.fast_model}  smart={spec.smart_model}")
+        if not args.no_list:
+            found = POOL.discover(key, force=True) or {}
+            ids = list(found.get("ids") or [])
+            if ids:
+                print(f"    key can see  : {len(ids)} models -> {', '.join(ids[:12])}"
+                      f"{' …' if len(ids) > 12 else ''}")
+                print(f"    chosen       : fast={found.get('fast') or '-'}  smart={found.get('smart') or '-'}")
+                code = 0
+            else:
+                print(f"    key can see  : nothing listed ({found.get('reason') or 'no /models endpoint?'})")
+        print(f"    will send    : fast={POOL.model_for(key, 'fast')}  smart={POOL.model_for(key, 'smart')}")
+        rejected = sorted(m for m, until in ((POOL._health_for(key).get("bad_models") or {}).items())  # noqa: SLF001
+                         if float(until or 0) > time.time())
+        if rejected:
+            print(f"    refused earlier: {', '.join(rejected)}")
+        if cooling:
+            print(f"    COOLING        : {left // 60}m left ({reason})")
+    print("\n  live probe (one word each):")
+    probed = POOL.probe()
+    for key, outcome in (probed.get("providers") or {}).items():
+        if outcome.get("ok"):
+            print(f"    {key:11s} OK    {outcome['latency_ms']}ms on {outcome.get('model')} -> {outcome.get('reply')!r}")
+            code = 0
+        else:
+            print(f"    {key:11s} FAIL  {str(outcome.get('error'))[:150]}")
+    if args.ask:
+        try:
+            out = POOL.complete([{"role": "user", "content": args.ask}],
+                                tier=choose_tier(args.ask))
+            print(f"\n  answer via {out['provider']}:{out['model']} ({out['latency_ms']}ms): {out['content'][:400]}")
+            code = 0
+        except LlmError as exc:
+            print(f"\n  answer failed: {exc}")
+            for attempt in getattr(exc, "attempts", []) or []:
+                print(f"    - {attempt.get('provider')} {attempt.get('model', '')} "
+                      f"{attempt.get('status', '')} {str(attempt.get('error'))[:120]}")
+    print("\n  Fix it: put a working key in .env, or pin the ids this account can use, e.g.")
+    print("    GROQ_MODEL_FAST=llama-3.1-8b-instant")
+    print("    GROQ_MODEL_SMART=llama-3.1-8b-instant     (or any bigger id from the list above)")
+    return code
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(_cli())

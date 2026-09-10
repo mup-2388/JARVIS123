@@ -581,6 +581,11 @@ class Router:
             for round_no in range(1, MAX_TOOL_ROUNDS + 1):
                 completion = POOL.complete(messages, tools=TOOL_SCHEMAS, tier=tier)
                 self.last_model = completion["provider"] + ":" + completion["model"]
+                if completion.get("model_switched"):
+                    # The provider's advertised model was refused and the pool recovered -
+                    # worth a line in the log, because it means the .env id needs pinning.
+                    log.info("%s answered with %s instead of the configured %s model",
+                             completion["provider"], completion["model"], tier)
                 content = completion["content"]
                 native_calls = completion["tool_calls"]
                 calls = list(native_calls) or ([c for c in [parse_tool_call_from_text(content)] if c])
