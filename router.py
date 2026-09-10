@@ -275,6 +275,53 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "Session/power control. Only use when the user explicitly asks: lock, sleep, shutdown, restart, cancel-shutdown.",
         {"action": {"type": "string", "enum": ["lock", "sleep", "shutdown", "restart", "cancel-shutdown"], "description": "Power action."}},
     ),
+    _fn(
+        "calendar_agenda",
+        "What is on the user's Google/Outlook calendar for the next N days (default 1 = today): classes, "
+        "meetings, shifts, visits. Use for 'what's on my calendar', 'what do I have tomorrow', 'my agenda', "
+        "'any meetings this week'.",
+        {"days": {"type": "string", "description": "How many days to look ahead, as digits. '1' = today, '7' = a week."}},
+    ),
+    _fn(
+        "calendar_next",
+        "The single next upcoming calendar event (class, meeting, shift…). Use for 'what's next', 'my next class', 'when's my next meeting'.",
+        {},
+    ),
+    _fn(
+        "todo",
+        "The everyday to-do list. add writes an item, list shows them, done ticks one off, clear empties it. "
+        "Use for 'add submit the CBS assignment to my todo', 'what's on my todo', 'tick off gym'.",
+        {
+            "action": {"type": "string", "enum": ["list", "add", "done", "clear"], "description": "list / add / done(remove) / clear."},
+            "text": {"type": "string", "description": "The item text for add/done."},
+        },
+    ),
+    _fn(
+        "daily_brief",
+        "The morning brief: today's date, calendar, to-do list and pending reminders in one answer. "
+        "Use for 'good morning', 'what does my day look like', 'daily brief', 'summarise my day'.",
+        {},
+    ),
+    _fn(
+        "draft_email",
+        "Write an email draft and open the mail app (Outlook/mailto) with it prefilled - no credentials needed. "
+        "Use for 'draft an email to X saying...', 'write an email to my professor'.",
+        {
+            "to": {"type": "string", "description": "Recipient address. '' to leave blank."},
+            "subject": {"type": "string", "description": "Subject line."},
+            "body": {"type": "string", "description": "Email body text."},
+        },
+    ),
+    _fn(
+        "send_email",
+        "Actually SEND an email through the SMTP server in .env (SMTP_HOST/SMTP_USER/SMTP_PASSWORD). Falls back to "
+        "drafting if SMTP is not configured. Use only when the user explicitly says 'send'.",
+        {
+            "to": {"type": "string", "description": "Recipient address."},
+            "subject": {"type": "string", "description": "Subject line."},
+            "body": {"type": "string", "description": "Email body text."},
+        },
+    ),
 ]
 
 TOOL_NAMES = {s["function"]["name"] for s in TOOL_SCHEMAS}
@@ -555,6 +602,22 @@ _KEYWORD_PLAN: List[Tuple[re.Pattern[str], str, Callable[[re.Match[str]], Dict[s
      "take_screenshot", lambda m: {}),
     (re.compile(r"\b(volume|mute|louder|quieter|turn (?:it )?(?:up|down))\b", re.I),
      "set_volume", lambda m: {"delta": 6 if re.search(r"up|louder|increase", m.string, re.I) else -6}),
+    # ---- calendar / todo / brief / email ----------------------------------------
+    (re.compile(r"\b(?:what(?:'s| is)? (?:on|in) my (?:calendar|schedule|agenda)|my agenda|"
+                r"what (?:do i have|am i doing|have i got)(?: scheduled| on)?\b)", re.I),
+     "calendar_agenda", lambda m: {"days": "7" if re.search(r"week|coming", m.string, re.I) else "1"}),
+    (re.compile(r"\b(?:next|upcoming) (?:class|lecture|meeting|shift|appointment|event)|what('s| is) (?:next|up next|coming up)\b", re.I),
+     "calendar_next", lambda m: {}),
+    (re.compile(r"\b(?:add|put|write)\b[^.]{0,60}\b(?:to (?:my )?(?:to ?do|todo|to-do|task list|checklist))\b", re.I),
+     "todo", lambda m: {"action": "add", "text": re.sub(r"^.*?(?:add|put|write)\s+", "", m.string, flags=re.I).split(" to ", 1)[0].strip(" .,")}),
+    (re.compile(r"\b(?:what(?:'s| is) (?:on )?(?:my )?(?:to ?do|todo|to-do|task list|checklist)|show (?:my )?(?:to ?do|todo|task list))\b", re.I),
+     "todo", lambda m: {"action": "list", "text": ""}),
+    (re.compile(r"\b(?:good morning|morning brief|daily brief|start my day|what does my day look like|summar(?:ise|ize) my day)\b", re.I),
+     "daily_brief", lambda m: {}),
+    (re.compile(r"\b(?:draft|write|compose)\s+(?:an?\s+)?(?:email|mail)\b", re.I),
+     "draft_email", lambda m: {"to": "", "subject": "", "body": ""}),
+    (re.compile(r"\bsend\s+(?:an?\s+)?(?:email|mail)\b", re.I),
+     "send_email", lambda m: {"to": "", "subject": "", "body": ""}),
 ]
 
 
@@ -574,6 +637,7 @@ _SPECIFICITY = {
     "control_desktop": 83, "focus_app": 79, "listening": 76,
     "take_screenshot": 80, "set_volume": 78, "close_app": 74, "launch_app": 72,
     "play_youtube": 70, "search_on_site": 66, "open_website": 60, "system_report": 58, "get_time": 55,
+    "daily_brief": 96, "calendar_agenda": 95, "calendar_next": 93, "todo": 92, "draft_email": 90, "send_email": 89,
     "web_search": 20,
 }
 
@@ -590,7 +654,7 @@ def heuristic_plan(text: str, allow_search: bool = True) -> List[Dict[str, Any]]
             args = build(match)
         except Exception:  # noqa: BLE001
             continue
-        if not args and name not in {"get_time", "take_screenshot"}:
+        if not args and name not in {"get_time", "take_screenshot", "daily_brief", "calendar_next"}:
             continue
         seen.add(name)
         calls.append({"tool": name, "arguments": args})

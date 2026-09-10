@@ -907,6 +907,37 @@ def _rule_listening(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
     return {"calls": [{"tool": "listening", "arguments": {"status": action}}]}
 
 
+_CALENDAR_RE = re.compile(
+    r"what(?:'s| is)?\s+(?:on|in)\s+my\s+(?:calendar|schedule|agenda)|my\s+agenda|"
+    r"what\s+(?:do i have|am i doing|have i got)(?:\s+scheduled)?|"
+    r"(?:next|upcoming)\s+(?:class|lecture|meeting|shift|appointment|event)|"
+    r"what(?:'s| is)\s+(?:next|coming up)", re.I)
+_TODO_RE = re.compile(r"\b(?:todo|to-do|to\s*do\s+list|task\s*list|checklist)\b", re.I)
+_BRIEF_RE = re.compile(
+    r"\b(?:good morning|morning brief|daily brief|start my day|what does my day look like|"
+    r"summar(?:ise|ize) my day)\b", re.I)
+
+
+def _rule_calendar(m: re.Match[str], text: str) -> Dict[str, Any]:
+    low = text.lower()
+    if re.search(r"\b(next|upcoming|coming up)\b", low):
+        return _calls(("calendar_next", {}))
+    days = "7" if re.search(r"\bweek\b|coming days", low) else ("2" if "tomorrow" in low else "1")
+    return _calls(("calendar_agenda", {"days": days}))
+
+
+def _rule_todo(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    if re.search(r"\b(open|launch|start|close|quit)\b", text, re.I):
+        return None                     # "open the todo app" is a launch, not a list
+    if re.search(r"\b(add|put|write|note)\b", text, re.I):
+        item = re.sub(r"^.*?\b(add|put|write|note)\b\s*", "", text, flags=re.I)
+        item = re.split(r"\s+(?:to|on|in)\s+(?:my\s+)?(?:to ?do|todo|to-do|task list|checklist)",
+                        item, flags=re.I)[0]
+        if item.strip(" .,"):
+            return _calls(("todo", {"action": "add", "text": item.strip(" .,")}))
+    return _calls(("todo", {"action": "list", "text": ""}))
+
+
 INSTANT_RULES: List[Rule] = [
     # ---- hands: files, eyes, desktop, time, ears --------------------------
     ("files-undo", _FILE_UNDO_RE, _rule_files_undo),
@@ -927,6 +958,9 @@ INSTANT_RULES: List[Rule] = [
     ("apps-ask", _APPS_ASK_RE, _rule_apps_ask),
     ("focus-app", _FOCUS_APP_RE, _rule_focus_app),
     ("listening", _LISTENING_RE, _rule_listening),
+    ("brief", _BRIEF_RE, lambda m, t: _calls(("daily_brief", {}))),
+    ("calendar", _CALENDAR_RE, _rule_calendar),
+    ("todo", _TODO_RE, _rule_todo),
     ("greeting", _GREETING_RE, _rule_greeting),
     ("clear", _CLEAR_RE, lambda m, t: {"answer": "Context cleared.", "direct": True, "speak": True, "clear_history": True}),
     ("stop", _STOP_RE, lambda m, t: {"answer": "Stopped.", "direct": True, "speak": False, "stop_tts": True}),
@@ -1609,6 +1643,28 @@ def create_app() -> FastAPI:
     @app.get("/api/apps")
     async def api_apps() -> Dict[str, Any]:
         return await asyncio.to_thread(tools.list_launchable_apps)
+
+    @app.get("/api/calendar")
+    async def api_calendar(days: int = 1) -> Dict[str, Any]:
+        """The calendar agenda for the next N days (default today)."""
+        return await asyncio.to_thread(tools.calendar_agenda, str(days))
+
+    @app.get("/api/calendar/next")
+    async def api_calendar_next() -> Dict[str, Any]:
+        return await asyncio.to_thread(tools.calendar_next)
+
+    @app.get("/api/todo")
+    async def api_todo() -> Dict[str, Any]:
+        return await asyncio.to_thread(tools.todo, "list", "")
+
+    @app.post("/api/todo")
+    async def api_todo_post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
+        return await asyncio.to_thread(tools.todo, str(payload.get("action", "list")),
+                                       str(payload.get("text", "")))
+
+    @app.get("/api/brief")
+    async def api_brief() -> Dict[str, Any]:
+        return await asyncio.to_thread(tools.daily_brief)
 
     # ---------------- WebSocket --------------------------------------------
     @app.websocket("/ws")

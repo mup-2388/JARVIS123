@@ -1928,6 +1928,225 @@ def llm_status() -> Dict[str, Any]:
     return {"ok": True, "message": " ".join(lines), "llm": status}
 
 
+# --------------------------------------------------------------------------- calendar
+def _calendar_module() -> Any:
+    """Import the agenda (calendar) module once (stdlib-only, no heavy deps)."""
+    import agenda as _calendar
+
+    return _calendar
+
+
+def calendar_agenda(days: str = "") -> Dict[str, Any]:
+    """What is on the user's calendar for the next N days (default 1 = today)."""
+    try:
+        cal = _calendar_module()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Calendar module unavailable: {exc}"}
+    try:
+        n = float(days) if (days or "").strip() else 1.0
+    except ValueError:
+        n = 1.0
+    events = cal.agenda(days=max(0.5, min(n, 90.0)))
+    if not events:
+        _, errors = cal.load_events()
+        hint = f" ({errors[0]})" if errors and "configured" in errors[0] else ""
+        return {"ok": True, "message": f"Nothing is scheduled for the next {n:g} day(s).{hint}",
+                "events": [], "count": 0}
+    lines = [f"{e.when}: {e.summary}" + (f" @ {e.location}" if e.location else "")
+             for e in events[:12]]
+    return {"ok": True, "message": " · ".join(lines),
+            "events": [e.as_dict() for e in events[:12]], "count": len(events)}
+
+
+def calendar_next() -> Dict[str, Any]:
+    """The very next calendar event (class, meeting, shift…) whenever it is."""
+    try:
+        cal = _calendar_module()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Calendar module unavailable: {exc}"}
+    event = cal.next_event()
+    if event is None:
+        return {"ok": True, "message": "There is nothing coming up on your calendar.",
+                "event": None}
+    extra = f" at {event.location}" if event.location else ""
+    return {"ok": True,
+            "message": f"Next: {event.summary} — {event.when}{extra}.",
+            "event": event.as_dict()}
+
+
+# --------------------------------------------------------------------------- todo list
+def _todo_path() -> Path:
+    raw = (SETTINGS.todo_file or "notes/todo.md").strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = config.ROOT / path
+    return path
+
+
+def _todo_read() -> List[str]:
+    path = _todo_path()
+    if not path.is_file():
+        return []
+    return [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()]
+
+
+def todo(action: str = "list", text: str = "") -> Dict[str, Any]:
+    """The everyday to-do list: add items, tick them off, list, clear.  Persisted as Markdown."""
+    action = (action or "list").lower()
+    path = _todo_path()
+    items = _todo_read()
+    try:
+        if action in {"list", "show", "status"}:
+            if not items:
+                return {"ok": True, "message": "Your to-do list is empty.",
+                        "items": [], "count": 0}
+            return {"ok": True, "message": "To-do: " + " | ".join(items[:20]),
+                    "items": items, "count": len(items)}
+        if action in {"add", "new", "append"}:
+            item = (text or "").strip()
+            if not item:
+                return {"ok": False, "message": "Tell me what to add, e.g. 'add to my todo: submit the CBS assignment'."}
+            for existing in items:
+                if existing.lower() == item.lower():
+                    return {"ok": True, "message": f"“{item}” is already on the list.", "items": items}
+            items.append(item)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(items) + "\n", encoding="utf-8")
+            return {"ok": True, "message": f"Added “{item}” to your to-do list. You have {len(items)} item(s).",
+                    "items": items, "count": len(items)}
+        if action in {"done", "remove", "delete", "complete"}:
+            needle = (text or "").strip().lower()
+            if not needle:
+                return {"ok": False, "message": "Which item? Say 'tick off <the item>'."}
+            kept = [it for it in items if it.lower() != needle]
+            if len(kept) == len(items):
+                return {"ok": False, "message": f"I couldn't find “{text}” on the list.", "items": items}
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            return {"ok": True, "message": f"Done. “{text}” removed; {len(kept)} item(s) left.",
+                    "items": kept, "count": len(kept)}
+        if action == "clear":
+            path.write_text("", encoding="utf-8")
+            return {"ok": True, "message": "To-do list cleared.", "items": [], "count": 0}
+    except OSError as exc:
+        return {"ok": False, "message": f"Could not update the to-do list: {exc}"}
+    return {"ok": False, "message": f"Unknown todo action “{action}” (list/add/done/clear)."}
+
+
+def daily_brief() -> Dict[str, Any]:
+    """The morning brief: today's date, calendar, to-do list, and pending reminders."""
+    import datetime as _dt
+
+    today_date = _dt.date.today().strftime("%A, %d %B %Y")
+    parts = [f"Here is your brief for {today_date}."]
+
+    try:
+        cal = _calendar_module()
+        todays = cal.agenda(days=1.0)
+        if todays:
+            parts.append("Calendar: " + " · ".join(
+                f"{e.when}: {e.summary}" + (f" @ {e.location}" if e.location else "") for e in todays[:8]))
+        else:
+            parts.append("Calendar: nothing scheduled today.")
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"Calendar: unavailable ({exc}).")
+
+    items = _todo_read()
+    parts.append("To-do: " + (" | ".join(items[:12]) if items else "nothing on the list."))
+
+    try:
+        if _reminders is not None:
+            rows = _reminders.BOARD.list()
+            if rows:
+                due = "; ".join(f"{str(r.get('text', ''))} at {r.get('due_iso', '?')}" for r in rows[:5])
+                parts.append(f"Reminders: {due}.")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {"ok": True, "message": " ".join(parts),
+            "date": today_date, "todo": items, "events": todays if 'todays' in dir() else []}
+
+
+# --------------------------------------------------------------------------- email
+def _open_mailto(mailto: str) -> Dict[str, Any]:
+    if config.is_windows():
+        try:
+            import winops as _w
+
+            out = _w.shell_execute(mailto)
+            if out.get("ok"):
+                return {"ok": True, "message": "Opened your mail app with the draft."}
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        import webbrowser
+
+        if webbrowser.open(mailto):
+            return {"ok": True, "message": "Opened your mail app with the draft."}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": False, "message": f"Your mail app could not be opened. Draft URI: {mailto}"}
+
+
+def _save_draft(to: str, subject: str, body: str) -> Path:
+    folder = config.ROOT / "notes" / "drafts"
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = folder / f"email-{stamp}.md"
+    text = (f"# Email draft ({stamp})\n\n"
+            f"**To:** {to or '(not set)'}\n\n**Subject:** {subject or '(not set)'}\n\n{body or ''}\n")
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def draft_email(to: str = "", subject: str = "", body: str = "") -> Dict[str, Any]:
+    """Write an email draft AND open the mail app with it prefilled (no credentials needed)."""
+    to = (to or SETTINGS.email_default_to or "").strip()
+    subject = (subject or "").strip()
+    body = (body or "").strip()
+    if not subject and not body:
+        return {"ok": False, "message": "What should the email say? Give me a subject and a body."}
+    try:
+        path = _save_draft(to, subject, body)
+    except OSError as exc:
+        return {"ok": False, "message": f"Could not save the draft: {exc}"}
+    mailto = ("mailto:" + _urlparse.quote(to or "") + "?subject=" + _urlparse.quote(subject)
+              + "&body=" + _urlparse.quote(body))
+    opened = _open_mailto(mailto)
+    return {"ok": True, "message": f"Draft saved to {path.name} — {opened['message']}",
+            "draft": str(path), "to": to, "subject": subject, "opened": bool(opened.get("ok"))}
+
+
+def send_email(to: str = "", subject: str = "", body: str = "") -> Dict[str, Any]:
+    """Actually SEND an email via the SMTP server configured in .env (falls back to drafting)."""
+    to = (to or SETTINGS.email_default_to or "").strip()
+    subject = (subject or "").strip()
+    body = (body or "").strip()
+    if not to or "@" not in to:
+        return {"ok": False, "message": "I need a real recipient address to send to."}
+    if not (SETTINGS.smtp_host and SETTINGS.smtp_user and SETTINGS.smtp_password):
+        return {"ok": False,
+                "message": ("No SMTP server is configured, so I can't send directly. "
+                            "I'll draft it instead — set SMTP_HOST/SMTP_USER/SMTP_PASSWORD in .env "
+                            "to send for real."),
+                "hint": "draft-created" if (subject or body) else ""}
+    try:
+        import smtplib
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["From"] = SETTINGS.email_from or SETTINGS.smtp_user
+        msg["To"] = to
+        msg["Subject"] = subject
+        msg.set_content(body or "")
+        with smtplib.SMTP(SETTINGS.smtp_host, int(SETTINGS.smtp_port), timeout=20) as server:
+            server.starttls()
+            server.login(SETTINGS.smtp_user, SETTINGS.smtp_password)
+            server.send_message(msg)
+        return {"ok": True, "message": f"Email sent to {to}.", "to": to, "subject": subject}
+    except Exception as exc:  # noqa: BLE001 - auth/network must not crash the assistant
+        return {"ok": False, "message": f"Email failed to send: {exc}"}
+
 
 TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "launch_app": launch_app,
@@ -1953,6 +2172,12 @@ TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "read_screen": read_screen,
     "set_reminder": set_reminder,
     "listening": listening,
+    "calendar_agenda": calendar_agenda,
+    "calendar_next": calendar_next,
+    "todo": todo,
+    "daily_brief": daily_brief,
+    "draft_email": draft_email,
+    "send_email": send_email,
 }
 
 

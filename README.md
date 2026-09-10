@@ -197,6 +197,22 @@ target decide which tool runs, and a named website always beats the app list:
 `.env`, then talk to your PC from anywhere. Toggle HUD "discord relay" to mirror local replies back
 into the channel.
 
+**Your day** — calendar, to-do list, morning brief and email, wired into both tracks:
+
+| You say | JARVIS does |
+| --- | --- |
+| `what's on my calendar`, `what do I have tomorrow`, `my agenda` | reads your Google/Outlook `.ics` feed (`calendar_agenda`) |
+| `what's my next class`, `any meetings coming up` | the single next event (`calendar_next`) |
+| `good morning`, `what does my day look like` | date + calendar + to-do + reminders (`daily_brief`) |
+| `add submit the CBS assignment to my todo`, `what's on my todo`, `tick off gym` | the Markdown to-do list (`todo`) |
+| `draft an email to my professor saying…` | writes the draft to `notes/drafts/` **and** opens Outlook with it prefilled (`draft_email`, no credentials) |
+| `send an email to …` | actually sends via SMTP when `SMTP_HOST/USER/PASSWORD` are set (`send_email`) |
+| `open teams`, `open outlook`, `open the college portal` | `launch_app` (Teams/Outlook are built in; set `CBS_PORTAL_URL` for the portal) |
+
+Set up the calendar with **zero OAuth**: Google Calendar → Settings → *Secret address in iCal format*
+→ paste the URL into `CALENDAR_ICS_URLS` (Outlook: Share → Publish this calendar → ICS link).
+Exported `.ics` files (e.g. the CBS timetable) go in `CALENDAR_ICS_FILES`.
+
 ## 5 · API
 
 ```

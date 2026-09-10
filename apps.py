@@ -390,6 +390,13 @@ BUILTIN: Dict[str, Dict[str, Any]] = {
                      "aliases": {"drive", "google drive"}},
     "maps": {"display": "Maps", "kind": "url", "target": "https://www.google.com/maps",
              "aliases": {"maps", "google maps", "directions"}},
+    # --- school / college ---
+    #: Set the portal URL with CBS_PORTAL_URL in .env (defaults to the CBS site).
+    "college portal": {"display": "College portal", "kind": "url", "target": SETTINGS.cbs_portal_url,
+                       "aliases": {"college portal", "cbs", "school portal", "university portal", "my college",
+                                   "campus portal", "student portal", "cbs portal"}},
+    "google classroom": {"display": "Classroom", "kind": "url", "target": "https://classroom.google.com",
+                         "aliases": {"classroom", "google classroom", "classes", "my courses"}},
 }
 
 #: ``ms-settings:`` sub-pages people ask for in everyday words.

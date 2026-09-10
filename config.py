@@ -174,6 +174,28 @@ class Settings:
     #: Voice reminders / timers ("remind me in 10 minutes to stretch").
     reminders_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("REMINDERS_ENABLED"), True))
     reminders_file: str = field(default_factory=lambda: dotenv("REMINDERS_FILE", "data/reminders.json"))
+    #: Calendar (Google/Outlook/any iCal feed).  CALENDAR_ICS_URLS takes the
+    #: read-only ".ics" URLs (Google: "secret address in iCal format"), and
+    #: CALENDAR_ICS_FILES takes exported .ics files.  Colon/semicolon/comma
+    #: separated.  With no feeds, calendar tools answer with a setup hint.
+    calendar_ics_urls: str = field(default_factory=lambda: dotenv("CALENDAR_ICS_URLS", ""))
+    calendar_ics_files: str = field(default_factory=lambda: dotenv("CALENDAR_ICS_FILES", ""))
+    calendar_lookahead_days: int = field(default_factory=lambda: _coerce_int(dotenv("CALENDAR_LOOKAHEAD_DAYS"), 7))
+    calendar_cache_minutes: int = field(default_factory=lambda: _coerce_int(dotenv("CALENDAR_CACHE_MINUTES"), 15))
+    calendar_timeout: int = field(default_factory=lambda: _coerce_int(dotenv("CALENDAR_TIMEOUT"), 8))
+    calendar_cache_dir: str = field(default_factory=lambda: dotenv("CALENDAR_CACHE_DIR", "data/calendar"))
+    #: The day's to-do list lives in this Markdown file (one "- [ ] item" per line).
+    todo_file: str = field(default_factory=lambda: dotenv("TODO_FILE", "notes/todo.md"))
+    #: School/college portal opened by "open the college portal".
+    cbs_portal_url: str = field(default_factory=lambda: dotenv("CBS_PORTAL_URL", "https://www.cbs.de"))
+    #: Optional SMTP so JARVIS can actually send email (leave empty to draft + open
+    #: the mail client via mailto: instead, which is zero-setup and just as safe).
+    smtp_host: str = field(default_factory=lambda: dotenv("SMTP_HOST", ""))
+    smtp_port: int = field(default_factory=lambda: _coerce_int(dotenv("SMTP_PORT"), 587))
+    smtp_user: str = field(default_factory=lambda: dotenv("SMTP_USER", ""))
+    smtp_password: str = field(default_factory=lambda: dotenv("SMTP_PASSWORD", ""))
+    email_from: str = field(default_factory=lambda: dotenv("EMAIL_FROM", ""))
+    email_default_to: str = field(default_factory=lambda: dotenv("EMAIL_DEFAULT_TO", ""))
     #: Hard wall-clock ceiling for one "ask the AI" turn across *all* providers.
     #: Better a heuristic answer in 25 s than a frozen mic for 3 minutes.
     llm_budget_seconds: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_BUDGET_SECONDS"), 25))
