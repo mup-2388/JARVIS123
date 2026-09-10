@@ -186,6 +186,12 @@ body {
 .pill-model-local { opacity: 0.55; }
 .chip { font-size: 9.5px; padding: 4px 9px; border-radius: 999px; }
 .chip-mini { padding: 2px 7px; font-size: 8.5px; }
+/* round 7: the "Hands & ears" panel - what the desktop layer can do, and the always-on ear */
+.chip-warn { color: #ffd9a3; border-color: rgba(255, 190, 90, .45); background: rgba(255, 170, 60, .1); }
+.chip-live { color: #b8ffe0; border-color: rgba(90, 255, 190, .5); background: rgba(60, 255, 170, .12);
+             animation: chip-pulse 2.4s ease-in-out infinite; }
+@keyframes chip-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(90, 255, 190, .32); }
+                        50% { box-shadow: 0 0 10px 1px rgba(90, 255, 190, .22); } }
 .chip-toggle.is-on {
   background: rgba(34, 211, 238, 0.2);
   border-color: rgba(34, 211, 238, 0.7);

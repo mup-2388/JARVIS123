@@ -142,6 +142,38 @@ class Settings:
     # Free tiers rename and retire models constantly; this is what stops a retired id
     # such as "llama-3.3-70b-versatile" costing the user every answer.
     llm_auto_discover: bool = field(default_factory=lambda: _coerce_bool(dotenv("LLM_AUTO_DISCOVER"), True))
+    # -- desktop control (apps, files, screen, background listening) -------------
+    #: How long the Start-Menu / Get-StartApps / registry app indexes stay cached.  Long
+    #: enough that JARVIS never blocks on PowerShell mid-sentence, short enough that an app
+    #: installed today is findable in a few minutes.
+    app_index_ttl: int = field(default_factory=lambda: _coerce_int(dotenv("APP_INDEX_TTL"), 900))
+    app_index_file: str = field(default_factory=lambda: dotenv("APP_INDEX_FILE", "data/app_index.json"))
+    #: "open X" waits this long for the window to appear, so JARVIS can say "Settings is
+    #: opening" instead of "done" when nothing actually happened.
+    app_wait_seconds: int = field(default_factory=lambda: _coerce_int(dotenv("APP_WAIT_SECONDS"), 4))
+    #: Everything file-related is confined to these roots (colon/semicolon separated).
+    #: "" means %USERPROFILE%\\Documents\\JARVIS, which JARVIS creates on first use.
+    files_root: str = field(default_factory=lambda: dotenv("FILES_ROOT", ""))
+    #: Extra folders the user grants for reads/writes, e.g. "C:\\Users\\me\\Desktop;D:\\notes".
+    files_allowed: str = field(default_factory=lambda: dotenv("FILES_ALLOWED", ""))
+    #: Delete = recycle bin always; "never" refuses permanent deletes outright.
+    file_delete_policy: str = field(default_factory=lambda: dotenv("FILE_DELETE_POLICY", "recycle"))
+    #: Screen reading: local OCR first (free, offline), then an optional vision model.
+    screen_ocr_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("SCREEN_OCR"), True))
+    screen_vision_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("SCREEN_VISION"), True))
+    #: Background always-on listening: wake words, push-to-talk key and the floating bar.
+    wake_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("WAKE_WORD_ENABLED"), True))
+    wake_words: str = field(default_factory=lambda: dotenv("WAKE_WORDS", "jarvis,jervis,jarvi,yarves"))
+    wake_fuzzy: bool = field(default_factory=lambda: _coerce_bool(dotenv("WAKE_FUZZY"), True))
+    wake_followup_seconds: int = field(default_factory=lambda: _coerce_int(dotenv("WAKE_FOLLOWUP_SECONDS"), 12))
+    wake_command_key: str = field(default_factory=lambda: dotenv("WAKE_HOTKEY", "f12"))
+    wake_push_to_talk: str = field(default_factory=lambda: dotenv("WAKE_PTT_KEY", "rcontrol"))
+    bar_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("OVERLAY_BAR"), True))
+    bar_width: int = field(default_factory=lambda: _coerce_int(dotenv("OVERLAY_WIDTH"), 720))
+    bar_height: int = field(default_factory=lambda: _coerce_int(dotenv("OVERLAY_HEIGHT"), 96))
+    #: Voice reminders / timers ("remind me in 10 minutes to stretch").
+    reminders_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("REMINDERS_ENABLED"), True))
+    reminders_file: str = field(default_factory=lambda: dotenv("REMINDERS_FILE", "data/reminders.json"))
     #: Hard wall-clock ceiling for one "ask the AI" turn across *all* providers.
     #: Better a heuristic answer in 25 s than a frozen mic for 3 minutes.
     llm_budget_seconds: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_BUDGET_SECONDS"), 25))

@@ -39,7 +39,11 @@ from llm_providers import LlmError, POOL, choose_tier, looks_like_research
 
 log = get_logger("router")
 
-MAX_TOOL_ROUNDS = 3
+#: "open Chrome, search for X and read me the top three results" is four tool calls deep, and
+#: a chain that stops at round three is the difference between an assistant and a toy.  Rounds
+#: are cheap when the tools answer in milliseconds - LLM_BUDGET_SECONDS is what bounds a
+#: turn, not this number.
+MAX_TOOL_ROUNDS = 6
 HISTORY_TURNS = max(4, SETTINGS.history_size // 2)
 
 # ---------------------------------------------------------------------------
@@ -81,6 +85,110 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         },
     ),
     _fn(
+        "focus_app",
+        "Bring an already-open app to the front instead of launching a second copy: 'look at Teams', "
+        "'switch to Chrome', 'go back to my terminal'.",
+        {"name": {"type": "string", "description": "App or window title to focus"}},
+    ),
+    _fn(
+        "list_apps",
+        "List what is installed and launchable on this machine. Use it before claiming an app does not "
+        "exist, and when the user asks 'what apps can I open'.",
+        {"query": {"type": "string", "description": "Optional filter, e.g. 'emulator' or 'adobe'"}},
+    ),
+    _fn(
+        "windows_on_screen",
+        "Which windows are open and which one has focus - the cheap way to answer 'what am I looking at' "
+        "or 'is that download still running in another window'.",
+        {"limit": {"type": "string", "description": "How many windows to list, as digits"}},
+    ),
+    _fn(
+        "manage_files",
+        "Create, write, append, read, list, search, move, copy, rename, delete (to the Recycle Bin), undo, "
+        "and run a script you just wrote. This is how the user gets real work done: 'make a file called "
+        "notes.md with...', 'delete old.txt', 'find every python file with TODO in it', 'write a python "
+        "script that renames my downloads and run it'. Writes are confined to the folders JARVIS owns; a "
+        "path outside them returns needs_confirmation, so ask first and only repeat with confirm='yes' when "
+        "the user agrees. .docx/.pptx can be read. undo restores the last delete or overwrite.",
+        {
+            "action": {"type": "string", "enum": ["list", "read", "write", "overwrite", "append", "delete",
+                                                 "search", "move", "copy", "rename", "mkdir", "note",
+                                                 "undo", "disk", "open", "script", "run", "recent"],
+                      "description": "What to do with files. 'write' creates (and refuses to clobber), 'overwrite' replaces, 'delete' means Recycle Bin, 'undo' reverses the last change."},
+            "path": {"type": "string", "description": "File or folder, e.g. 'notes.md' or 'Desktop/todo.txt'; '' means the JARVIS folder"},
+            "content": {"type": "string", "description": "Text to write (markdown is fine)"},
+            "destination": {"type": "string", "description": "Target for move/copy/rename"},
+            "query": {"type": "string", "description": "Name pattern for search, e.g. '*.md'"},
+            "text": {"type": "string", "description": "Phrase to find inside files, or a sort key for list"},
+            "confirm": {"type": "string", "description": "'yes' only after the user agreed to an outside-root write or delete"},
+            "run": {"type": "string", "description": "'yes' to execute a script immediately after writing it"},
+            "language": {"type": "string", "description": "python | powershell | bat | js | sh | html"},
+            "limit": {"type": "string", "description": "How many results, as digits"},
+        },
+    ),
+    _fn(
+        "control_desktop",
+        "Drive the desktop itself: type into the focused window, press keys or shortcuts (ctrl+s, alt+tab, "
+        "win+d), click, scroll, minimise/maximise the current window, read or set the clipboard, volume and "
+        "media keys, screenshot, wallpaper, a Windows notification, lock the PC, list processes. Use it for "
+        "'type hello into the box', 'press escape', 'save that file', 'mute', 'next song', 'minimise this'.",
+        {
+            "action": {"type": "string", "enum": ["type", "press", "hotkey", "click", "move", "scroll",
+                                                  "scroll_up", "minimize", "maximize", "restore", "focus",
+                                                  "list_windows", "clipboard", "clipboard_write", "volume",
+                                                  "media", "screenshot", "lock", "wallpaper", "notify",
+                                                  "battery", "processes", "open_folder", "beep"],
+                      "description": "The desktop action. Everything acts on the window that has focus, so say what the user said rather than guessing coordinates."},
+            "text": {"type": "string", "description": "What to type, or the volume/media target"},
+            "keys": {"type": "string", "description": "Key for press, e.g. 'escape' or 'down'"},
+            "combo": {"type": "string", "description": "Shortcut for hotkey, e.g. 'ctrl+s'"},
+            "x": {"type": "string", "description": "Screen x, or '' for the current pointer"},
+            "y": {"type": "string", "description": "Screen y, or '' for the current pointer"},
+            "button": {"type": "string", "enum": ["left", "right", "middle"],
+                      "description": "Mouse button for click; 'left' when unused."},
+            "amount": {"type": "string", "description": "Repeat count or scroll notches, as digits"},
+            "level": {"type": "string", "description": "Volume percent for set"},
+            "path": {"type": "string", "description": "File/folder for screenshot, wallpaper, open_folder"},
+        },
+    ),
+    _fn(
+        "read_screen",
+        "Use the eyes. 'read' = OCR every word currently on screen (offline). 'list' = the top N results or "
+        "listings, which is what 'read out the top three' means. 'describe' = send the capture to a vision "
+        "model and answer a question about it ('what is this error', 'what am I looking at'). 'window' = the "
+        "focused window and the open ones. 'save' = write what you read into a file.",
+        {
+            "action": {"type": "string", "enum": ["read", "list", "describe", "window", "capture", "save"],
+                      "description": "read = OCR text, list = top N items, describe = vision model answer, window = titles only, capture = save an image, save = write what was read to a file."},
+            "count": {"type": "string", "description": "How many items for list, as digits (default 3)"},
+            "question": {"type": "string", "description": "What to ask about the screen for describe"},
+            "target": {"type": "string", "enum": ["screen", "window"], "description": "Whole display or the focused window"},
+            "save_to": {"type": "string", "description": "Filename for action=save"},
+        },
+    ),
+    _fn(
+        "set_reminder",
+        "Timers, reminders and scheduled commands - things that happen later without the user asking again. "
+        "'remind me in ten minutes to stretch', 'set a timer for 25 minutes', 'at 7:30 pm check my download' "
+        "(run='yes' when the text is a task, not a note), 'what have I got scheduled', 'cancel the gym "
+        "reminder', 'snooze it 10 minutes'. when takes the user's own words.",
+        {
+            "action": {"type": "string", "enum": ["add", "list", "cancel", "snooze"],
+                      "description": "add schedules one, list shows what is pending, cancel removes by text or id, snooze pushes it back by minutes."},
+            "text": {"type": "string", "description": "What to remind about, or which reminder to cancel"},
+            "when": {"type": "string", "description": "'in ten minutes' | 'at 7:30 pm' | 'tomorrow at 9' | 'every 2 hours'"},
+            "minutes": {"type": "string", "description": "Fallback span as digits, used only when when is empty"},
+            "run": {"type": "string", "description": "'yes' to execute text as a command at that time"},
+        },
+    ),
+    _fn(
+        "listening",
+        "The background ear: start or stop always-on wake-word listening, ask for five seconds of mic now, "
+        "or report why it is off (no sounddevice, no mic, disabled in .env).",
+        {"status": {"type": "string", "enum": ["status", "start", "stop", "listen"],
+                   "description": "status reports, start/stop switch the always-on ear, listen grabs five seconds from the mic right now."}},
+    ),
+    _fn(
         "llm_status",
         "Report which AI providers are configured, which one answers, and which are cooling down "
         "after hitting a quota. For 'which model are you using', 'AI status', 'check the providers'.",
@@ -88,8 +196,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     ),
     _fn(
         "launch_app",
-        "Start a Windows application (Steam, Discord, the Eden emulator for FC 26, Chrome/Edge/Firefox, VS Code, Terminal, Spotify, Calculator...). "
-        "Use for 'open/launch/start <app>'. Returns ok=false with a hint when the app is unknown.",
+        "Open ANY application, Settings page, Control Panel applet or installed program by the name the user "
+        "used - Chrome, Microsoft Teams, Task Manager, Bluetooth settings, Steam, Word, Downloads, Recycle "
+        "Bin. Do not wonder whether it is installed: the resolver searches the Start Menu, UWP packages, the "
+        "uninstall registry and App Paths, and when it misses it answers with the closest real names to "
+        "offer instead. Use for 'open/launch/start/focus <app>'.",
         {
             "app_name": {"type": "string", "description": "Application name or alias, e.g. 'Steam', 'Eden', 'chrome'."},
             "url": {"type": "string", "description": "Optional URL to open if the app is a browser. '' when unused."},
@@ -252,6 +363,16 @@ ESSENTIAL_ARGS: Dict[str, Tuple[str, ...]] = {
     "system_power": ("action",),
     "fetch_sports_stats": (),   # falls back to API_SPORTS_DEFAULT_TEAM
     "read_notes": (),           # empty topic == "list my notes"
+    # The wide tools are action-dispatched, so the action is the one thing that must be there;
+    # everything else is optional and validated by the tool itself with a spoken error.
+    "manage_files": ("action",),
+    "control_desktop": ("action",),
+    "read_screen": ("action",),
+    "set_reminder": ("action",),
+    "focus_app": ("name",),
+    "listening": (),
+    "list_apps": (),
+    "windows_on_screen": (),
 }
 
 
@@ -318,8 +439,28 @@ def validate_call(name: str, args: Dict[str, Any]) -> Tuple[Optional[str], Optio
 # ---------------------------------------------------------------------------
 
 _KEYWORD_PLAN: List[Tuple[re.Pattern[str], str, Callable[[re.Match[str]], Dict[str, Any]]]] = [
-    (re.compile(r"\b(open|launch|start|boot up|fire up)\b[^.]*?\b(chrome|edge|firefox|browser|steam|discord|spotify|notepad|calculator|code|vs ?code|terminal|powershell|explorer|obs|paint|settings|task ?manager|eden|fc ?26)\b", re.I),
-     "launch_app", lambda m: {"app_name": m.group(2).strip()}),
+    # "what windows are open", "which apps do I have running" - that is a question about the
+    # desktop, and the generic "open X" rule below would otherwise read it as a request to launch
+    # the word "right".  Both rules answer with the window list, focused window first.
+    (re.compile(r"\b(?:what|which|list|show|how many)\b[^.?]{0,30}\b(?:windows|apps|programs|windows)\b"
+                r"[^.?]{0,20}\b(?:open|running|up right|right now|currently|on screen)\b", re.I),
+     "windows_on_screen", lambda m: {"limit": "12"}),
+    (re.compile(r"^\s*(?:hey[ ,]+)?(?:jarvis[ ,]+)?what(?:'s| is| do i) (?:open|running|up)"
+                r"(?: on (?:my|the) (?:screen|desktop|pc))?(?: right now)?\s*[?.]*$", re.I),
+     "windows_on_screen", lambda m: {"limit": "12"}),
+    # The whole tail is the app name: the resolver knows ms-settings pages, UWP packages,
+    # Start-menu shortcuts and the registry, so "open my bluetooth settings" must not be
+    # flattened to "settings" by a keyword list that can never keep up with Windows.  It is
+    # anchored to the start of the sentence, because "what windows are open right now" is a
+    # question - and a name never survives a conjunction: "open google and read the top 3"
+    # means google, and the reading part is its own call, which the planner chains.
+    (re.compile(r"^\s*(?:(?:hey|ok|yo)[ ,]+)?(?:jarvis[ ,]+)?(?:could you |can you |would you |please |just |simply |quickly |now )*?"
+                r"(?:open|launch|start|boot(?: up)?|fire up|spin up|bring up|run|wake|show me)\s+(?:up\s+)?"
+                r"(?:the\s+|my\s+|our\s+)?(?P<app>[a-z][a-z0-9 .&'+_-]{1,40}?)"
+                r"(?:\s+(?:app|application|program|software|exe))?(?:\s+right\s+now|\s+now|\s+please|\s+for me|\s+thanks)?"
+                r"[.!?]*$", re.I),
+     "launch_app", lambda m: {"app_name": re.split(r"\s+(?:and|then|plus|after that)\s+",
+                                                   (m.group("app") or "").strip())[0].strip(" .,")}),
     (re.compile(r"\b(close|quit|kill|exit|terminate)\b[^.]*?\b(chrome|edge|firefox|browser|steam|discord|spotify|notepad|calculator|code|terminal|explorer|obs|eden)\b", re.I),
      "close_app", lambda m: {"app_name": m.group(2).strip()}),
     (re.compile(r"\b(play|put on|queue up)\b(?:\s+(?:the\s+|my\s+))?(.+?)(?:\s+on\s+youtube|\s+on\s+yt|\?|$)", re.I),
@@ -329,6 +470,61 @@ _KEYWORD_PLAN: List[Tuple[re.Pattern[str], str, Callable[[re.Match[str]], Dict[s
      "search_on_site", lambda m: {"site": (m.group("site") or "").strip(), "query": (m.group("q") or "").strip(" .?"), "open_browser": True}),
     (re.compile(r"\bsearch\s+(?P<site>[a-z][a-z0-9 ._-]{1,24}?)\s+for\s+(?P<q>.+)$", re.I),
      "search_on_site", lambda m: {"site": (m.group("site") or "").strip(), "query": (m.group("q") or "").strip(" .?"), "open_browser": True}),
+    # "open my bluetooth settings", "open device manager", "open the downloads folder"
+    (re.compile(r"\b(?:open|show|go to)\s+(?:the\s+|my\s+)?(?P<t>[a-z][a-z .&'-]{2,38}?(?:settings|panel|manager|bin|folder|center|centre))\s*$", re.I),
+     "launch_app", lambda m: {"app_name": (m.group("t") or "").strip()}),
+    # ---- files ------------------------------------------------------------------
+    (re.compile(r"\b(?:create|make|write|start)(?: me| up)?\s+(?:a\s+|my\s+)?(?:new\s+)?(?:(?:txt|md|markdown|py|python|csv|html|json|js|text)\s+)?(?:file|document|doc|folder|directory|script)?\s*(?:called|named|titled)?\s*['\"]?(?P<name>[\w\- .()]{2,50}?)['\"]?\s*(?:with|that says|containing)\s*['\"]?(?P<body>.{1,900})$", re.I),
+     "manage_files", lambda m: {"action": "write", "path": (m.group("name") or "").strip(),
+                                "content": (m.group("body") or "").strip().strip('"')}),
+    (re.compile(r"\b(?:delete|remove|erase|trash|get rid of)\s+(?:the\s+|my\s+|a\s+|an\s+|this\s+|that\s+)?"
+                r"(?:file\s+|folder\s+|document\s+|doc\s+)?(?:called\s+|named\s+|titled\s+)?[\x22\x27]?"
+                r"(?P<name>[\w\- .()\\/]{2,60}?)[\x22\x27]?\s*(?:please|for me|now|thanks|dot\s+\w+)?$", re.I),
+     "manage_files", lambda m: {"action": "delete", "path": (m.group("name") or "").strip(" .,")}),
+    (re.compile(r"\b(?:what(?:'s| is) in|read|summar(?:ise|ize)|tell me about)\s+(?:the\s+|my\s+)?(?:file|doc(?:ument)?|notes?)\s*['\"]?(?P<name>[\w\- .()\\/]{2,60})", re.I),
+     "manage_files", lambda m: {"action": "read", "path": (m.group("name") or "").strip()}),
+    (re.compile(r"\b(?:list|show)\s+(?:my|the)\s+(?:files|folder|documents|downloads)\b", re.I),
+     "manage_files", lambda m: {"action": "list", "path": "downloads" if "downloads" in m.group(0).lower() else ""}),
+    (re.compile(r"\b(?:find|search for)\s+(?:a\s+|my\s+)?files?\s+(?:named\s+|with\s+)?['\"]?(?P<name>[\w\- .*()]{2,50})", re.I),
+     "manage_files", lambda m: {"action": "search", "query": (m.group("name") or "").strip()}),
+    (re.compile(r"\bundo\s+(?:that|it|the last (?:file )?(?:change|delete|write))\b", re.I),
+     "manage_files", lambda m: {"action": "undo", "path": "", "content": "", "destination": "", "query": "",
+                                "text": "", "confirm": "", "run": "", "language": "", "limit": "1"}),
+    # ---- eyes -------------------------------------------------------------------
+    (re.compile(r"\b(what am i looking at|what('s| is) on (?:my|the) screen|read (?:my|the) screen|describe (?:the|my) screen|look at (?:my|the) screen)\b", re.I),
+     "read_screen", lambda m: {"action": "describe" if ("describe" in m.group(0) or "looking at" in m.group(0)) else "read",
+                               "count": "3", "question": "", "target": "screen", "save_to": ""}),
+    (re.compile(r"\b(?:top|first)\s+(?P<n>\d{1,2}|one|two|three|four|five)\s+(?:results?|listings?|items?|links?|products?|offers?|entries)\b", re.I),
+     "read_screen", lambda m: {"action": "list",
+                               "count": {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5"}.get((m.group("n") or "3").lower(), m.group("n")),
+                               "question": "", "target": "screen", "save_to": ""}),
+    # ---- desktop ----------------------------------------------------------------
+    (re.compile(r"\b(?:type|write)\s+['\"](?P<text>.{1,300})['\"]", re.I),
+     "control_desktop", lambda m: {"action": "type", "text": (m.group("text") or "").strip()}),
+    (re.compile(r"\b(?:type|write)\s+(?P<text>.{1,200}?)\s+(?:in|into)\s+(?:the|my)\s+(?:box|field|search|bar|text ?box|terminal|console|editor|address bar)\b", re.I),
+     "control_desktop", lambda m: {"action": "type", "text": (m.group("text") or "").strip()}),
+    (re.compile(r"\b(?:press|hit|tap)\s+(?P<k>escape|enter|tab|space|backspace|delete|f\d{1,2}|down arrow|up arrow|right arrow|left arrow)\b", re.I),
+     "control_desktop", lambda m: {"action": "press", "keys": (m.group("k") or "").strip()}),
+    (re.compile(r"\b(?:save (?:this|that|the file)|press ctrl ?s)\b", re.I),
+     "control_desktop", lambda m: {"action": "hotkey", "combo": "ctrl+s"}),
+    (re.compile(r"\b(?:minimi[sz]e|hide)\s+(?:this|the current|the active)\s*(?:window|app)?\b", re.I),
+     "control_desktop", lambda m: {"action": "minimize"}),
+    (re.compile(r"\bmaximi[sz]e\s+(?:this|the window)\b", re.I),
+     "control_desktop", lambda m: {"action": "maximize"}),
+    (re.compile(r"\b(?:switch to|go back to|focus|look at)\s+(?P<t>[a-z][a-z0-9 .'_-]{1,30})$", re.I),
+     "focus_app", lambda m: {"name": (m.group("t") or "").strip()}),
+    # ---- later, at a time -------------------------------------------------------
+    (re.compile(r"\bremind me\b(?:\s+(?:to|that|about))?\s*(?P<what>.{0,140}?)\s*(?P<when>in\s+[\w ]{2,30}|at\s+[\w :]{2,20}|tomorrow[\w ]{0,20}|tonight[\w ]{0,20})\s*$", re.I),
+     "set_reminder", lambda m: {"action": "add", "text": (m.group("what") or "").strip(" .,!?"),
+                                "when": (m.group("when") or "").strip(), "minutes": "", "run": ""}),
+    (re.compile(r"\bset (?:a\s+)?timer for\s+(?P<when>[\w ]{2,30})", re.I),
+     "set_reminder", lambda m: {"action": "add", "text": "Timer finished", "when": "in " + (m.group("when") or "").strip(),
+                                "minutes": "", "run": ""}),
+    (re.compile(r"\bcancel\s+(?:the\s+|my\s+)?(?:timer|reminder|alarm)(?:\s+(?:about|for|to)\s+(?P<what>.{2,60}))?\s*$", re.I),
+     "set_reminder", lambda m: {"action": "cancel", "text": (m.group("what") or "").strip(),
+                                "when": "", "minutes": "", "run": ""}),
+    (re.compile(r"\b(?:what(?:'s| is) (?:on|my) (?:schedule|reminders|timers)|list (?:my )?reminders)\b", re.I),
+     "set_reminder", lambda m: {"action": "list", "text": "", "when": "", "minutes": "", "run": ""}),
     # Explicit research verbs only: "what is X" is the model's job, not DDG's.
     (re.compile(r"\b(search|google|look up|find out|news about|weather in)\s+(?:for\s+)?(.+)", re.I),
      "web_search", lambda m: {"query": re.sub(r"\b(please|for me|me)\b", "", m.group(2), flags=re.I).strip(" .?")}),
@@ -373,7 +569,9 @@ def _strip_fillers(text: str) -> str:
 #: Higher = more specific. "score of Real Madrid" must not fall through to a
 #: generic web search when the sports tool clearly owns the intent.
 _SPECIFICITY = {
+    "manage_files": 94, "set_reminder": 92, "read_screen": 91,
     "write_note": 90, "read_notes": 88, "fetch_sports_stats": 86, "system_power": 84,
+    "control_desktop": 83, "focus_app": 79, "listening": 76,
     "take_screenshot": 80, "set_volume": 78, "close_app": 74, "launch_app": 72,
     "play_youtube": 70, "search_on_site": 66, "open_website": 60, "system_report": 58, "get_time": 55,
     "web_search": 20,
@@ -407,8 +605,15 @@ def heuristic_plan(text: str, allow_search: bool = True) -> List[Dict[str, Any]]
         calls = [c for c in calls if not (c["tool"] == "web_search" and _SPECIFICITY.get(c["tool"], 0) < 55)]
     if any(c["tool"] == "write_note" for c in calls):
         calls = [c for c in calls if c["tool"] != "read_notes"]  # dictation, not lookup
-    if len(calls) > 3:
-        calls = calls[:3]
+    if any(c["tool"] == "manage_files" and (c.get("arguments") or {}).get("action") == "write" for c in calls):
+        # "write a file called X with Y" is a file job, not a notes job - exactly one of them runs.
+        calls = [c for c in calls if c["tool"] != "write_note"]
+    file_actions = {(c.get("arguments") or {}).get("action") for c in calls if c["tool"] == "manage_files"}
+    if file_actions & {"read", "search", "list"}:
+        # "read the file notes.md" names a file, so don't also search the notes folder for it.
+        calls = [c for c in calls if c["tool"] != "read_notes"]
+    if len(calls) > 4:
+        calls = calls[:4]
     if not calls and (text or "").strip() and allow_search:
         # Only reached when the question genuinely needs the outside world; the agent -
         # not this function - owns "what is X" style questions.
@@ -423,8 +628,11 @@ def heuristic_plan(text: str, allow_search: bool = True) -> List[Dict[str, Any]]
 SYSTEM_PROMPT = """You are J.A.R.V.I.S, a native Windows assistant with direct control of this machine.
 
 Rules, in priority order:
-1. Act, do not speculate. When the user asks for anything on this PC (open/close apps, volume, screenshot, telemetry) or for live facts (prices, restaurants, news, football scores, their own study notes), call the matching tool instead of answering from memory.
-2. One tool call at a time is fine, but you may call several tools when the request has several parts ("open Steam and tell me my RAM").
+1. Act, do not speculate. When the user asks for anything on this PC - open/close/focus apps, Settings pages, volume, screenshots, creating or deleting files, typing or clicking, reading the screen, reminders - call the matching tool instead of answering from memory, and never say "done" before a tool returned ok. If a tool fails, say in one line what failed.
+1b. You have hands now: manage_files (create/overwrite/append/read/search/delete-to-Recycle-Bin/undo/run a script you wrote), control_desktop (SendInput typing, hotkeys, clicks, scroll, window control, clipboard, volume, media, wallpaper, notifications, lock), read_screen (offline OCR, "top three listings", or a vision model for "what am I looking at"), set_reminder (timers and scheduled commands), list_apps, focus_app, windows_on_screen. Prefer acting over explaining how the user could do it themselves.
+1c. For a multi-step request ("open Chrome, search X, read me the top three") keep calling tools for as many rounds as it takes and give the spoken summary at the end.
+1d. manage_files returns needs_confirmation for anything outside the folders you own: ask one short question, and only repeat with confirm="yes" after the user agrees. Deletes inside your own folders are always recoverable, so never refuse one.
+2. One tool call at a time is fine, and several in sequence are better for multi-part requests ("open Steam and tell me my RAM").
 3. Pass empty strings for unused optional arguments. Never invent file paths, team ids, prices or scores - read them from the tool response.
 4. Only call system_power when the user explicitly asks to lock/sleep/shutdown/restart.
 5. After the tool result, answer in 1-3 short spoken sentences: concrete numbers first, no markdown, no preamble like "here is what I found".

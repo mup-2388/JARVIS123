@@ -118,6 +118,8 @@ class ProviderSpec:
     # Ids worth trying if the two above are refused or not visible to this key: providers
     # retire model names without telling anyone, and entitlements differ per account.
     fallback_models: Tuple[str, ...] = ()
+    #: Ids that accept image input, for "look at my screen".  Discovery overrides these.
+    vision_models: Tuple[str, ...] = ()
     extra_headers: Dict[str, str] = field(default_factory=dict)
 
     # -- credentials -------------------------------------------------------
@@ -207,6 +209,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
             # older accounts, and discovery overrides all of it per key anyway.
             fast_model="openai/gpt-oss-20b",
             smart_model="openai/gpt-oss-120b",
+            vision_models=("qwen/qwen3.6-27b", "meta-llama/llama-4-scout-17b-16e-instruct"),
             fallback_models=("llama-3.1-8b-instant", "llama-3.3-70b-versatile",
                              "qwen/qwen3.6-27b", "groq/compound-mini"),
             key_env="GROQ_API_KEY",
@@ -247,6 +250,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
             base_url="https://generativelanguage.googleapis.com/v1beta/openai",
             fast_model="gemini-2.5-flash-lite",
             smart_model="gemini-2.5-flash",
+            vision_models=("gemini-2.5-flash", "gemini-2.5-flash-lite"),
             key_env="GEMINI_API_KEY",
             reset="daily-pacific",
             free_quota="~1,000 req/day on Flash-Lite, 250 on Flash; 5-15 req/min",
@@ -258,6 +262,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
             base_url="https://api.mistral.ai/v1",
             fast_model="mistral-small-latest",
             smart_model="magistral-small-latest",
+            vision_models=("mistral-small-latest", "pixtral-128b-2409"),
             key_env="MISTRAL_API_KEY",
             reset="none",
             free_quota="free 'Experiment' tier, ~1B tokens/month, prompts may be logged for training",
@@ -269,6 +274,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
             base_url="https://openrouter.ai/api/v1",
             fast_model="meta-llama/llama-3.1-8b-instruct:free",
             smart_model="openai/gpt-oss-120b:free",
+            vision_models=("meta-llama/llama-4-scout-17b-16e-instruct:free",),
             key_env="OPENROUTER_API_KEY",
             reset="daily-utc",
             free_quota="50 req/day on ':free' models (1,000/day after a $10 top-up)",
@@ -281,6 +287,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
             base_url="https://models.inference.ai.azure.com",
             fast_model="Meta-Llama-3.1-8B-Instruct",
             smart_model="gpt-4o",
+            vision_models=("gpt-4o", "gpt-4o-mini"),
             key_env="GITHUB_MODELS_TOKEN",
             reset="none",
             free_quota="150-1,000 req/day per model; needs a PAT with the 'models:read' scope (not your gh/CI token)",
@@ -468,6 +475,7 @@ def _model_row(row: Any) -> Dict[str, Any]:
         raw = raw[len("models/"):]
     feats = [str(f).lower() for f in (row.get("supported_features") or [])]
     out_mods = [str(m).lower() for m in (row.get("output_modalities") or [])]
+    in_mods = [str(m).lower() for m in (row.get("input_modalities") or [])]
     ctx = row.get("context_window") or row.get("context_length") or row.get("supported_input_tokens") or 0
     try:
         ctx = int(ctx)
@@ -477,7 +485,11 @@ def _model_row(row: Any) -> Dict[str, Any]:
             "tools": (("tools" in feats or "function_calling" in feats) if feats else None),
             "json": (("json_mode" in feats or "structured_outputs" in feats) if feats else None),
             "context": ctx or None,
-            "text_out": ("text" in out_mods) if out_mods else None}
+            "text_out": ("text" in out_mods) if out_mods else None,
+            # Vision matters for "what am I looking at": an id that cannot take an image
+            # would 400 on the screenshot, so it must never be chosen for that job.
+            "vision": ("image" in in_mods or "image_url" in in_mods) if in_mods else None,
+            "active": (row.get("active") is not False)}
 
 
 def _model_rows(body: Any) -> List[Dict[str, Any]]:
@@ -521,7 +533,7 @@ def _pick_models(rows: List[Dict[str, Any]], need_tools: bool = True) -> Tuple[s
         mid = str(row.get("id") or "")
         if not mid or _MODEL_BANNED.search(mid):
             continue
-        if row.get("text_out") is False:          # audio / speech-only outputs
+        if row.get("text_out") is False or row.get("active") is False:   # audio, or listed-but-off
             continue
         clean.append(row)
     capable = [r for r in clean if r.get("tools") is True]
@@ -813,8 +825,10 @@ class LlmPool:
             if mid and mid not in ids:
                 ids.append(mid)
         fast, smart, capable = _pick_models(rows)
+        vision = [str(r.get("id")) for r in rows if r.get("vision") and not _MODEL_BANNED.search(str(r.get("id") or ""))]
         picked = {"at": int(time.time()), "count": len(ids), "ids": ids[:200],
                   "fast": fast, "smart": smart or fast, "tools": capable[:60],
+                  "vision": vision[:40],
                   "context": {str(r.get("id")): r.get("context") for r in rows
                               if r.get("context") and len(ids) <= 60},
                   "reason": "" if ids else f"HTTP {status}: no model list"}
@@ -839,8 +853,14 @@ class LlmPool:
         json_mode: bool = False,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        images: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Chat completion from the first healthy provider. Raises ``LlmError``."""
+        """Chat completion from the first healthy provider. Raises ``LlmError``.
+
+        ``images`` (data URLs or https URLs) switches the last user turn to OpenAI-style
+        multimodal content; providers whose key cannot see an image-capable model are skipped
+        rather than sent a request that is sure to fail.
+        """
         offline_left = float(getattr(self, "_offline_until", 0) or 0) - time.time()
         if offline_left > 0:
             raise LlmError(f"offline: LLM providers are unreachable for the next {int(offline_left)}s")
@@ -883,6 +903,18 @@ class LlmPool:
                 # model, its other model, and whatever /models says the key can see. A
                 # retired or not-entitled id must never cost the user the answer.
                 ladder = self.models_to_try(key, tier)
+                if images:
+                    # Vision is a per-model property: keep only ids known to take an image.
+                    found = self._health_for(key).get("discovered") or {}
+                    if not found.get("vision") and SETTINGS.llm_auto_discover:
+                        found = self.discover(key) or {}
+                    known = list(found.get("vision") or []) + list(spec.vision_models)
+                    if spec.style != "openai":
+                        attempts.append({"provider": key, "error": "no image input on this API style",
+                                        "skipped": True})
+                        continue
+                    if known:
+                        ladder = [m for m in ladder if m in known] or known
                 cursor = 0
                 discovered_here = False
                 give_up = False
@@ -900,7 +932,8 @@ class LlmPool:
                     for attempt_no in range(2):          # 2nd pass: retry without native tools
                         started = time.perf_counter()
                         try:
-                            payload = self._payload(spec, model, messages,
+                            payload = self._payload(spec, model,
+                                                     self._with_images(messages, images),
                                                      tools=tools if use_tools else None,
                                                      json_mode=json_mode, max_tokens=max_tokens, temperature=temperature)
                             url = spec.endpoint(model)
@@ -979,6 +1012,34 @@ class LlmPool:
         self.last_error = first_error or "every configured provider failed"
         self._save_state()
         raise LlmError(self.last_error, attempts)
+
+    @staticmethod
+    def _with_images(messages: List[Dict[str, Any]], images: Optional[List[str]]) -> List[Dict[str, Any]]:
+        """Rebuild the last user turn as multimodal content, leaving history untouched."""
+        if not images:
+            return messages
+        out = [dict(m) for m in messages]
+        for index in range(len(out) - 1, -1, -1):
+            if out[index].get("role") == "user":
+                text = out[index].get("content")
+                if isinstance(text, list):
+                    text = " ".join(str(part.get("text", "")) for part in text if isinstance(part, dict))
+                parts: List[Dict[str, Any]] = [{"type": "text", "text": str(text or "")}]
+                for image in images[:4]:
+                    url = str(image)
+                    if url and not url.startswith(("http://", "https://", "data:")):
+                        url = "data:image/png;base64," + url
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
+                out[index]["content"] = parts
+                break
+        return out
+
+    def vision(self, prompt: str, images: List[str], *, question: str = "",
+               max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        """:func:`complete` with an image, phrased the way the rest of JARVIS calls it."""
+        text = (question or prompt or "").strip() or "What is on this screen?"
+        return self.complete([{"role": "user", "content": text}], images=list(images),
+                             tier="smart", max_tokens=max_tokens)
 
     def _headers(self, spec: ProviderSpec) -> Dict[str, str]:
         headers = {"content-type": "application/json", "accept": "application/json",
@@ -1156,8 +1217,10 @@ class LlmPool:
                  # what /models discovery learned about this key, and which ids it refused
                  "models_seen": int((self._health_for(key).get("discovered") or {}).get("count", 0) or 0),
                  "discovered": {k: v for k, v in (self._health_for(key).get("discovered") or {}).items()
-                                if k in ("fast", "smart", "count", "at", "reason")},
+                                if k in ("fast", "smart", "count", "at", "reason", "vision")},
                  "model_ids": list((self._health_for(key).get("discovered") or {}).get("ids") or [])[:16],
+                 "vision_models": (self._health_for(key).get("discovered") or {}).get("vision")
+                 or list(PROVIDERS[key].vision_models),
                  "rejected_models": sorted(m for m, until in (self._health_for(key).get("bad_models") or {}).items()
                                            if float(until or 0) > time.time())}
                 for key in order()

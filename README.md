@@ -28,7 +28,14 @@ Markdown notes as a knowledge base, an agentic LLM brain and a Discord bridge.
 | `server.py` | FastAPI app, `/ws` WebSocket, telemetry pump, **Track 1** regex rules, mic endpoints, REST API |
 | `router.py` | **Track 2**: strict tool JSON schemas, agent loop, offline keyword planner, conversation memory |
 | `llm_providers.py` | The brain: 7 free-tier providers (Groq, Cerebras, Cloudflare Workers AI, Gemini, Mistral, OpenRouter, GitHub Models) plus your own endpoint, tier selection, quota-aware rotation, 24 h cooldowns that survive a restart |
-| `tools.py` | OS automation + live data: `launch_app`, `close_app`, `web_search`, `search_on_site`, `launch_app`, `open_website`, `fetch_sports_stats`, `read_notes`, `write_note`, `system_report`, `set_volume`, `take_screenshot`, `system_power`, `llm_status` |
+| `tools.py` | The tool surface the agent may call: `manage_files`, `control_desktop`, `read_screen`, `set_reminder`, `launch_app`, `focus_app`, `close_app`, `list_apps`, `windows_on_screen`, `listening`, `web_search`, `search_on_site`, `open_website`, `read_notes`, `write_note`, `system_report`, `set_volume`, `take_screenshot`, `system_power`, `llm_status` and more |
+| `winops.py` | Every Windows primitive in one place: `ShellExecute`, `SendInput`, window listing/activation, clipboard, volume, `IFileOperation` Recycle Bin, GDI capture - each guarded by `IS_WINDOWS`, each answering `{ok, message}` |
+| `apps.py` | Which app is which: an eight-rung resolution ladder (`ms-settings:` table, ~85-entry catalogue with AUMIDs, `CUSTOM_APPS`, Start-Menu `.lnk`, `Get-StartApps`, registry, PATH, difflib) plus launch-then-verify |
+| `files.py` | File powers on a leash: confined roots, a backup before every write, Recycle-Bin deletes with a private copy, an undo journal, `.docx/.xlsx/.pptx` text extraction, script authoring + execution |
+| `screen.py` | Eyes: capture -> Windows OCR (WinRT) -> tesseract -> ranked "top N listings", and `describe()` to a vision model only when `SCREEN_VISION=true` |
+| `wake.py` | The always-on ear: hysteresis energy gate, wake-word matching that survives "jervis"/"jarvi", follow-up window, global F12 + push-to-talk hotkeys |
+| `reminders.py` | Spoken time parsing ("in ten minutes", "at 7:30 pm", "every day at 8am") and a JSON schedule on a worker thread; due items are spoken, "run" items are executed |
+| `static/bar.html` · `static/bar.js` | The floating prompt bar: frameless, top-most, no-focus overlay to type or talk to JARVIS while another app keeps the caret |
 | `audio_engine.py` | `faster-whisper` STT (cuda/int8) + Coqui XTTS-v2 TTS with Windows SAPI5 fallback, VAD, playback |
 | `discord_bridge.py` | Background `discord.Client` on one channel → same router → chunked replies, auto-reconnect |
 | `config.py` | Stdlib `.env` loader + typed settings, logging, path resolution |
@@ -36,7 +43,7 @@ Markdown notes as a knowledge base, an agentic LLM brain and a Discord bridge.
 | `static/styles.css` | Meters, sparklines, terminal, pills, animations, scrollbar, webview chrome |
 | `static/arc_reactor.js` | WebGL render loop **and** the HUD client (WebSocket, telemetry, terminal, mic, cards) |
 | `notes/*.md` | Your study notes, read by `read_notes()` (German A2 + CS prep included as worked examples) |
-| `tests/test_jarvis.py` | 114 stdlib-unittest checks: schemas, regex precision, provider failover, notes scoring, VAD, REST |
+| `tests/test_jarvis.py` | 166 stdlib-unittest checks: schemas, regex precision, provider failover, notes scoring, VAD, REST |
 
 ## 2 · Setup (Windows)
 
@@ -215,7 +222,7 @@ Outbound: `hello`, `telemetry`, `log`, `state`, `reply`, `card`, `transcript`, `
 ## 6 · Verification
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover -s tests -v     # 114 cases, all offline
+.venv\Scripts\python.exe -m unittest discover -s tests -v     # 166 cases, all offline
 .venv\Scripts\python.exe -c "import router,json;print(json.dumps(router.TOOL_SCHEMAS[0],indent=2))"
 .venv\Scripts\python.exe -c "import llm_providers as l;print(l.POOL.configured() or 'NO KEYS');print(l.choose_tier('open steam'), l.choose_tier('compare the dative and accusative cases, then write a study plan'))"
 curl http://127.0.0.1:8760/api/telemetry
@@ -224,6 +231,76 @@ curl http://127.0.0.1:8760/api/llm
 curl -X POST http://127.0.0.1:8760/api/command -H "Content-Type: application/json" -d "{\"text\":\"what is the velocity of an unladen swallow\",\"speak\":false}"
 ```
 
+## Round 7 - hands, eyes, ears
+
+The complaint was that JARVIS could talk but could not *do*. It now can:
+
+| You say | What happens |
+| --- | --- |
+| "open bluetooth settings" | `ms-settings:bluetooth` through `ShellExecute` - Settings is a URI, not an .exe |
+| "open Microsoft Teams" | `Get-StartApps` supplies the store build's AUMID, launched via `shell:AppsFolder` |
+| "what can you open on this pc" | the real index: Start-Menu `.lnk` + `Get-StartApps` + `App Paths` + the uninstall hive |
+| "create a file called ideas.md with milk and eggs" | writes it under `FILES_ROOT`, journalled first |
+| "read shopping.txt" / "summarise memo.docx" | reads text; `.docx/.xlsx/.pptx` are unzipped and their XML text extracted |
+| "delete notes.txt" | Recycle Bin **and** a private copy in `data/file_trash`, so "undo that" works |
+| "what am I looking at" | screenshot -> local OCR -> ranked lines, or a vision model when `SCREEN_VISION=true` |
+| "read out the top 3 results" | ranks the OCR lines, dropping browser chrome and bare URLs |
+| "type "hello world"", "press escape", "minimize" | real `SendInput` into whichever window holds the caret |
+| "remind me in ten minutes to stretch" | scheduled, spoken when due |
+| "at 7 check my download folder" | scheduled **and run** through the normal command funnel at 19:00 |
+| "Jarvis" (from any app, any time) | the wake word - the always-on ear transcribes what follows and acts |
+| F12 anywhere | shows/hides the floating prompt bar: type or push-to-talk without losing your game/IDE |
+
+Every one of those is a genuine Win32/WinRT call (`SendInput`, `ShellExecuteW`, `BitBlt`,
+`IFileOperation`, `Windows.Media.Ocr`) - no new mandatory pip packages, and each layer answers
+`{ok, message}` so a failure is *spoken with its reason* instead of hidden behind "Done.".
+
+### Why "it doesn't know which app is which" is gone
+
+`apps.py` resolves a spoken name through eight rungs, in order: literal `ms-settings:`/URL/path,
+the ~70-entry Settings-page table, a ~85-entry built-in catalogue (aliases, AUMIDs, protocol
+handlers), your `CUSTOM_APPS`, the Start-Menu shortcut index, `Get-StartApps`, the
+`App Paths`/uninstall registry, `where.exe`, then `difflib` for spelling ("crome" -> Chrome).
+A hard-coded list can never cover a machine, so the list is *enumerated from Windows itself* and
+cached in `data/app_index.json` for `APP_INDEX_TTL` seconds. Launching then **verifies**: `open X`
+waits `APP_WAIT_SECONDS` for a window of that process to appear, and says "Settings is opening" or
+"Windows refused to start that program" - never a bare "Done.".
+
+### Safety
+
+Writes are confined to `FILES_ROOT` (+ `FILES_ALLOWED`); anything else returns `needs_confirmation`
+and JARVIS asks out loud, because a mis-heard filename must not touch `C:\`. Deletes go to the
+Recycle Bin *and* `data/file_trash/<timestamp>/`, and every create/overwrite/append/delete is
+journalled in `data/file_journal.jsonl`, which is what makes "undo that" real. Screen capture and
+OCR are local; only `describe` sends the PNG to a provider, and `SCREEN_VISION=false` stops even the
+LLM tools from doing that. Background listening never writes audio to disk, ducks itself while
+JARVIS is speaking, and can be switched off entirely with `WAKE_WORD_ENABLED=false`.
+
+### Optional installs that unlock more of it
+
+The core runs on the nine pinned packages alone.  These four make specific powers real on Windows:
+
+```powershell
+.venv\Scripts\pip.exe install sounddevice numpy   # the wake-word ear, push to talk, F12
+.venv\Scripts\pip.exe install winsdk              # on-screen text, nothing else to install
+.venv\Scripts\pip.exe install pytesseract         # OCR fallback (needs the Tesseract binaries)
+.venv\Scripts\pip.exe install pillow              # captures, wallpaper, image handling
+```
+
+Missing one is never a crash: without `sounddevice` the ear reports why it cannot start and the HUD
+microphone keeps working; without an OCR engine `read_screen` says so and offers the vision model.
+`python main.py` prints one line per capability at start-up (apps indexed, file roots, OCR, ear),
+so you can see what this machine gave you before you say a word.
+
+### New surface
+
+Tools: `manage_files` (19 actions), `control_desktop` (24), `read_screen`, `set_reminder`,
+`launch_app`, `focus_app`, `close_app`, `list_apps`, `windows_on_screen`, `listening`.
+Endpoints: `GET /api/desktop`, `GET /api/screen`, `GET|POST /api/reminders`, `POST /api/listening`,
+`POST /api/bar`, `GET /bar`. HUD: a "Hands & ears" panel with an ear toggle. `static/bar.html` +
+`static/bar.js` are the overlay itself - dependency-free, so it paints instantly with no internet.
+Vision-capable models are chosen from each key's `/models` metadata (`input_modalities`), so a
+screenshot is never sent to a text-only id such as `gpt-oss-20b`.
 ## 7 · Troubleshooting
 
 | Symptom | Cause → fix |

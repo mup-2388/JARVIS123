@@ -577,12 +577,19 @@ function handlePayload(payload) {
       });
       if (payload.model) log('sys', `brain: ${payload.model}${payload.tier ? ` · ${payload.tier} tier` : ''}`);
       if (String(payload.track || '') === 'agent') refreshProviders();
+      refreshDesktop();
       if (payload.error) log('err', String(payload.error).slice(0, 200));
       if (payload.card) renderCard(payload.card);
       if (payload.answer) setMode(payload.speak ? 'speaking' : 'idle');
       break;
     }
     case 'card': renderCard(payload); break;
+    case 'wake':
+      window.__jarvisEarOn = Boolean(payload.running);
+      renderDesktop({ apps: (window.__jarvisDesktop || {}).apps, files: (window.__jarvisDesktop || {}).files,
+                    screen: (window.__jarvisDesktop || {}).screen, reminders: (window.__jarvisDesktop || {}).reminders,
+                    listening: payload, windows: (window.__jarvisDesktop || {}).windows });
+      break;
     case 'transcript':
       log('tool', `≋ heard ${(num(payload.confidence) * 100).toFixed(0)}% in ${num(payload.latency_ms)} ms: ${payload.text}`);
       if (payload.text) $('cmd-input') && ($('cmd-input').placeholder = `jarvis, ${payload.text.slice(0, 60)}`);
@@ -738,6 +745,71 @@ function renderProviders(brain) {
 
 let providersBusy = false;
 let providersWarned = false;
+function renderDesktop(data) {
+  if (!data) return;
+  window.__jarvisDesktop = data;
+  window.__jarvisEarOn = Boolean((data.listening || {}).running);
+  const sum = $('desktop-summary');
+  const roots = $('desktop-roots');
+  const screen = $('desktop-screen');
+  const ear = $('btn-ear');
+  const apps = data.apps || {};
+  const files = data.files || {};
+  const eyes = data.screen || {};
+  const schedule = data.reminders || {};
+  if (sum) {
+    const bits = [`${apps.known || 0} apps I can open`,
+                  `files in ${(files.roots || []).length} folder${(files.roots || []).length === 1 ? '' : 's'}`,
+                  `${schedule.count || 0} scheduled`];
+    if (!data.windows) bits.push('desktop keys need Windows');
+    sum.textContent = bits.join(' · ');
+    sum.className = 'mt-2 font-mono text-[9.5px] leading-snug '
+      + ((apps.known || 0) > 0 ? 'text-cyan-100/55' : 'text-amber-200/80');
+  }
+  if (roots) {
+    roots.textContent = `files: ${(files.roots || []).join(', ') || 'none yet'}`.slice(0, 220);
+    roots.title = `Writes stay inside these folders; anything else needs a spoken “confirm”. Deletes go to the Recycle Bin (${files.delete_policy || 'recycle'}). Last ${files.journal || 0} file actions are journaled, so “undo that” works.`;
+  }
+  if (screen) {
+    screen.textContent = eyes.ocr_ready ? (eyes.vision ? 'screen: ocr + ai' : 'screen: ocr') : 'screen: ai only';
+    screen.title = eyes.detail || 'Windows OCR availability';
+    screen.classList.toggle('chip-warn', !eyes.ocr_ready);
+  }
+  if (ear) {
+    const on = !!(data.listening && data.listening.running);
+    ear.textContent = on ? 'ear on' : 'ear off';
+    ear.title = on
+      ? `Say “${data.listening.wake_word || 'Jarvis'}” from any app. ${data.listening.detail || data.listening.reason || ''}`
+      : (data.listening && (data.listening.detail || data.listening.reason)) || 'Wake-word ear off — click to start it';
+    ear.classList.toggle('chip-live', on);
+  }
+}
+
+async function refreshDesktop() {
+  if (document.hidden) return;
+  try {
+    renderDesktop(await rest('/api/desktop'));
+  } catch (error) {
+    const sum = $('desktop-summary');
+    if (sum) sum.textContent = `desktop check failed: ${String(error.message || error).slice(0, 80)}`;
+  }
+}
+
+async function toggleEar() {
+  const button = $('btn-ear');
+  if (button) { button.disabled = true; button.textContent = '…'; }
+  const running = Boolean(window.__jarvisEarOn);
+  try {
+    const data = await rest('/api/listening', { action: running ? 'stop' : 'start' });
+    log(data.ok === false ? 'warn' : 'sys', `ear: ${data.message || data.detail || (data.running ? 'listening for the wake word' : 'stopped')}`);
+    refreshDesktop();
+  } catch (error) {
+    log('err', `ear toggle failed: ${error.message}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 async function refreshProviders() {
   if (providersBusy || document.hidden) return;
   providersBusy = true;
@@ -1380,7 +1452,16 @@ $('btn-llm-probe')?.addEventListener('click', async () => {
 });
 
 setInterval(refreshProviders, 15000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshProviders(); });
+setInterval(refreshDesktop, 25000);
+$('btn-ear')?.addEventListener('click', toggleEar);
+$('btn-bar')?.addEventListener('click', async () => {
+  try {
+    const data = await rest('/api/bar', { action: 'toggle' });
+    log('sys', `bar: ${data.ok ? (data.visible ? 'shown over your other apps' : 'hidden') : data.message || 'unavailable'}`);
+  } catch (error) { log('err', `bar toggle failed: ${error.message}`); }
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { refreshProviders(); refreshDesktop(); } });
+refreshDesktop();
 
 document.addEventListener('keydown', (event) => {
   const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName || '');

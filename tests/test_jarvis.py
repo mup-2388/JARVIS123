@@ -19,6 +19,8 @@ import re
 import shutil
 import sys
 import tempfile
+import time
+from datetime import datetime
 import unittest
 import wave
 from pathlib import Path
@@ -32,6 +34,11 @@ os.environ.setdefault("TTS_ENABLED", "false")
 import config  # noqa: E402
 import discord_bridge  # noqa: E402
 import router  # noqa: E402
+import files  # noqa: E402
+import screen  # noqa: E402
+import wake  # noqa: E402
+import reminders  # noqa: E402
+import llm_providers  # noqa: E402
 import server  # noqa: E402
 import tools  # noqa: E402
 from audio_engine import ENGINE as voice  # noqa: E402
@@ -758,6 +765,12 @@ class TestLlmProviders(unittest.TestCase):
         os.environ["CUSTOM_LLM_BASE_URL"] = "https://integrate.api.nvidia.com/v1/chat/completions"
         os.environ["CUSTOM_LLM_API_KEY"] = "nvapi-demo"
         os.environ["CUSTOM_LLM_MODEL_FAST"] = "meta/llama-3.1-8b-instruct"
+        # config.dotenv() answers os.environ first and the .env file second - and a *blank*
+        # environment value counts as unset, which is how "KEY=" in .env.example behaves.  To test
+        # "no SMART id at all" (the case where FAST must cover both tiers) the file is taken out of
+        # the picture for the duration of the call.
+        real_dotenv = self.lp.config.dotenv
+        self.lp.config.dotenv = lambda key, default="": os.environ.get(key, default)
         try:
             self.lp.ensure_custom()
             spec = self.lp.PROVIDERS["custom"]
@@ -775,6 +788,7 @@ class TestLlmProviders(unittest.TestCase):
             self.assertEqual(out["provider"], "custom")
             self.assertEqual(out["content"], "nim says hi")
         finally:
+            self.lp.config.dotenv = real_dotenv
             for name in ("CUSTOM_LLM_BASE_URL", "CUSTOM_LLM_API_KEY", "CUSTOM_LLM_MODEL_FAST"):
                 os.environ.pop(name, None)
             self.lp.ensure_custom()
@@ -1318,6 +1332,535 @@ class TestWindowBootstrap(unittest.TestCase):
         self.assertNotIn("@window.events", code, "the load event must be subscribed with +=, never used as a decorator")
         self.assertIn("attach_loaded_handler(window, on_loaded)", source)
 
+
+# ------------------------------------------------------- round 7: apps, files, eyes, ears, time
+class TestAppKnowledge(unittest.TestCase):
+    """"It doesn't know which app is which" - the resolution ladder, no Windows required."""
+
+    @classmethod
+    def setUpClass(cls):
+        import apps
+        cls.apps = apps
+
+    def test_verbs_politeness_and_suffixes_are_stripped(self):
+        self.assertEqual(self.apps.strip_verbs("could you please open the bluetooth settings app now"),
+                         "bluetooth settings")
+        self.assertEqual(self.apps.strip_verbs("hey jarvis, launch chrome"), "chrome")
+        self.assertEqual(self.apps.strip_verbs(""), "")
+
+    def test_settings_pages_are_uris_not_executables(self):
+        self.assertEqual(self.apps.settings_page("bluetooth settings"), "ms-settings:bluetooth")
+        ref = self.apps.resolve("open bluetooth settings")
+        self.assertIsNotNone(ref, "a Settings page must resolve on any OS - the tables are static")
+        self.assertTrue(str(ref.target).startswith("ms-settings:"), ref.as_dict())
+
+    def test_store_apps_come_with_an_aumid(self):
+        ref = self.apps.resolve("microsoft teams")
+        self.assertIsNotNone(ref, "new Teams is a store package; the catalogue must know its AUMID")
+        self.assertTrue(ref.aumid or "AppsFolder" in str(ref.target), ref.as_dict())
+
+    def test_spelling_is_corrected_and_reported(self):
+        ref = self.apps.resolve("crome")
+        self.assertIsNotNone(ref)
+        self.assertIn("chrome", (ref.key or "").lower())
+        self.assertEqual(ref.corrected_from, "crome")
+
+    def test_an_unknown_app_is_an_explicit_none(self):
+        self.assertIsNone(self.apps.resolve("xyzzy-not-a-program-9913"))
+
+    def test_custom_apps_are_read_from_the_environment(self):
+        os.environ["CUSTOM_APPS"] = "code editor = C:/Vscode/Code.exe"
+        try:
+            table = self.apps.custom_apps()
+            self.assertEqual(table.get("code-editor"), "C:/Vscode/Code.exe", table)
+            self.assertEqual(self.apps.resolve("code editor").target, "C:/Vscode/Code.exe")
+        finally:
+            del os.environ["CUSTOM_APPS"]
+
+    def test_suggest_gives_a_did_you_mean(self):
+        self.assertTrue(any("settings" in n.lower() for n in self.apps.suggest("sett")),
+                        self.apps.suggest("sett"))
+
+    def test_known_names_are_unique_and_sorted(self):
+        names = self.apps.known_names()
+        self.assertGreater(len(names), 40, "the catalogue alone must already be useful")
+        self.assertIn("Command Prompt", names)
+        self.assertIn("Microsoft Teams", names)
+        self.assertEqual(names, sorted(set(names)), "no duplicates, stable order for the HUD")
+
+    def test_launch_failure_carries_a_reason(self):
+        result = self.apps.launch("xyzzy-not-a-program-9913")
+        self.assertFalse(result["ok"])
+        self.assertGreater(len(result["message"]), 20, result)
+
+
+class _FileSandbox:
+    """Confine the file layer - root, journal, backups, trash - to one temp directory."""
+
+    def __init__(self, delete_policy="recycle"):
+        self.delete_policy = delete_policy
+        self.dir = None
+        self.saved = {}
+
+    def __enter__(self):
+        import files
+        self.files = files
+        self.dir = Path(tempfile.mkdtemp(prefix="jarvis-files-"))
+        root = self.dir / "Documents" / "JARVIS"
+        root.mkdir(parents=True)
+        self.root = root
+        self.saved = {"S": files.SETTINGS, "B": files.BACKUP_DIR, "T": files.TRASH_DIR,
+                      "J": files.JOURNAL}
+        files.SETTINGS = type("S", (), {"files_root": str(root), "files_allowed": "",
+                                        "file_delete_policy": self.delete_policy})()
+        files.BACKUP_DIR = self.dir / "backups"
+        files.TRASH_DIR = self.dir / "trash"
+        files.JOURNAL = self.dir / "journal.jsonl"
+        return root
+
+    def __exit__(self, *exc):
+        files = self.files
+        files.SETTINGS = self.saved["S"]
+        files.BACKUP_DIR = self.saved["B"]
+        files.TRASH_DIR = self.saved["T"]
+        files.JOURNAL = self.saved["J"]
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return False
+
+
+class TestFileLayer(unittest.TestCase):
+    def test_create_then_overwrite_then_append_then_undo(self):
+        with _FileSandbox() as root:
+            made = files.write("ideas.md", "milk and eggs")
+            self.assertTrue(made["ok"], made)
+            self.assertTrue((root / "ideas.md").is_file())
+            again = files.write("ideas.md", "bread")
+            self.assertFalse(again["ok"], "create must refuse to clobber")
+            self.assertIn("overwrite", again["message"].lower())
+            over = files.write("ideas.md", "bread", mode="overwrite")
+            self.assertTrue(over["ok"], over)
+            self.assertTrue(over["backup"], "the bytes it replaced must be backed up")
+            app = files.write("ideas.md", "coffee", mode="append")
+            self.assertTrue(app["ok"], app)
+            body = (root / "ideas.md").read_text(encoding="utf-8")
+            self.assertIn("bread", body)
+            self.assertIn("coffee", body)
+            read = files.read("ideas.md")
+            self.assertTrue(read["ok"], read)
+            self.assertIn("bread", read["message"])
+            self.assertIn("coffee", read["message"])
+            self.assertNotIn("milk", read["message"], "overwrite really replaced the first draft")
+            self.assertIn("milk", Path(over["backup"]).read_text(encoding="utf-8"),
+                          "the bytes overwrite destroyed must be recoverable")
+            undo = files.undo(1)
+            self.assertTrue(undo["ok"], undo)
+            self.assertNotIn("coffee", (root / "ideas.md").read_text(encoding="utf-8"))
+
+    def test_unknown_mode_is_refused_with_the_list_of_modes(self):
+        with _FileSandbox():
+            result = files.write("odd.txt", "x", mode="smash")
+            self.assertFalse(result["ok"])
+            self.assertIn("append", result["message"])
+
+    def test_writes_outside_the_root_are_refused_with_the_fix(self):
+        outside_dir = Path(tempfile.mkdtemp(prefix="jarvis-outside-"))
+        try:
+            with _FileSandbox():
+                target = outside_dir / "notes-todo.txt"
+                first = files.write(str(target), "hello", mode="overwrite")
+                self.assertFalse(first["ok"])
+                self.assertIn("FILES_ALLOWED", first["message"], first)
+                self.assertFalse(target.exists(), "a refusal must not touch the disk")
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+    def test_a_delete_outside_the_root_asks_first_then_obeys(self):
+        outside_dir = Path(tempfile.mkdtemp(prefix="jarvis-outside-"))
+        try:
+            with _FileSandbox():
+                target = outside_dir / "keep-or-go.txt"
+                target.write_text("somebody else's file", encoding="utf-8")
+                first = files.delete(str(target))
+                self.assertFalse(first["ok"])
+                self.assertTrue(first.get("needs_confirmation"), first)
+                self.assertTrue(first.get("confirm_token"))
+                self.assertTrue(target.is_file(), "asking is not doing")
+                second = files.delete(str(target), confirm="confirm")
+                self.assertTrue(second["ok"], second)
+                self.assertFalse(target.exists())
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+
+    def test_delete_goes_to_the_bin_and_undoes(self):
+        with _FileSandbox() as root:
+            files.write("doomed.txt", "evidence")
+            gone = files.delete("doomed.txt")
+            self.assertTrue(gone["ok"], gone)
+            self.assertFalse((root / "doomed.txt").exists())
+            kept = list(Path(files.TRASH_DIR).glob("*/doomed.txt"))
+            self.assertTrue(kept, "a private copy must exist so undo can put it back")
+            back = files.undo(1)
+            self.assertTrue(back["ok"], back)
+            self.assertTrue((root / "doomed.txt").is_file())
+
+    def test_refuse_policy_blocks_deletion(self):
+        with _FileSandbox(delete_policy="refuse") as root:
+            files.write("safe.txt", "keep me")
+            result = files.delete("safe.txt")
+            self.assertFalse(result["ok"])
+            self.assertIn("FILE_DELETE_POLICY", result["message"])
+            self.assertTrue((root / "safe.txt").is_file())
+
+    def test_a_misspelled_name_is_answered_with_a_neighbor(self):
+        with _FileSandbox():
+            files.write("quarterly-report.md", "numbers")
+            result = files.read("quarterly-reprot.md")
+            self.assertFalse(result["ok"])
+            self.assertIn("quarterly-report", result["message"])
+
+    def test_office_document_text_is_extracted_without_office(self):
+        import zipfile
+        with _FileSandbox() as root:
+            target = root / "memo.docx"
+            with zipfile.ZipFile(target, "w") as book:
+                book.writestr("[Content_Types].xml", "<Types/>")
+                book.writestr("word/document.xml",
+                              '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessing'
+                              '/ml/2006/main"><w:body><w:p><w:r><w:t>Hello from Word</w:t></w:r>'
+                              '</w:p></w:body></w:document>')
+            read = files.read("memo.docx")
+            self.assertTrue(read["ok"], read)
+            self.assertIn("Hello from Word", read["message"])
+
+    def test_search_and_list_never_raise_on_an_empty_folder(self):
+        with _FileSandbox():
+            self.assertTrue(files.list_dir("")["ok"])
+            hits = files.search(name="nothing-with-this-name-7781")
+            self.assertTrue(hits["ok"])
+            self.assertEqual(hits["results"], [])
+
+    def test_scripts_are_written_and_can_be_run(self):
+        with _FileSandbox() as root:
+            made = files.script("hello_jarvis.py", code="print('hi from the sandbox')")
+            self.assertTrue(made["ok"], made)
+            self.assertTrue((root / "scripts" / "hello_jarvis.py").is_file())
+            ran = files.execute_script("scripts/hello_jarvis.py")
+            self.assertTrue(ran["ok"], ran)
+            self.assertIn("hi from the sandbox", ran["message"])
+
+
+class TestScreenLayer(unittest.TestCase):
+    def test_top_results_prefers_real_titles_over_browser_chrome(self):
+        text = "\n".join([
+            "Google Chrome File Edit View History Bookmarks",
+            "https://www.google.com",
+            "Sign in",
+            "Sony WH-1000XM5 Wireless Headphones - 4.6 out of 5 stars (2,304)",
+            "$292.00  FREE delivery Tue, Sep 15",
+            "Bose QuietComfort Ultra Headphones, Wireless over-Ear 4.5 out of 5",
+            "www.amazon.com/dp/B0CJHK2MVS",
+            "Sennheiser Momentum 4 Wireless Headphones - 4.5 out of 5 stars",
+            "Results 1 - 16 of over 4,000 for headphones",
+        ])
+        rows = screen.top_results(text, count=3)
+        self.assertEqual(len(rows), 3, rows)
+        titles = " ".join(r["title"] for r in rows).lower()
+        self.assertIn("sony", titles)
+        self.assertIn("bose", titles)
+        self.assertIn("sennheiser", titles)
+        self.assertNotIn("sign in", titles)
+        self.assertNotIn("results 1", titles)
+
+    def test_count_is_respected_and_duplicates_dropped(self):
+        rows = screen.top_results("First listing with a decent length title here\n"
+                                  "First listing with a decent length title here\n"
+                                  "Second listing with a decent length title here", count=5)
+        self.assertEqual(len(rows), 2)
+
+    def test_garbage_in_and_out_without_a_crash(self):
+        self.assertEqual(screen.top_results("", count=3), [])
+        self.assertIsInstance(screen.top_results("\n\n1\n::\n", count=3), list)
+
+    def test_a_numbered_results_column_is_understood(self):
+        rows = screen.top_results("1.\nPython 3.12.0 download - python.org\npython.org\n"
+                                  "2.\nBest Python IDEs for Windows - JetBrains\njetbrains.com", count=2)
+        self.assertTrue(rows, "a numbered results column is exactly what this exists for")
+        self.assertTrue(any("Python 3.12.0" in row["title"] for row in rows), rows)
+
+    def test_read_screen_explains_a_missing_ocr_engine(self):
+        result = screen.read_screen(count=3)
+        self.assertIsInstance(result["ok"], bool)
+        if not result["ok"]:
+            self.assertGreater(len(result["message"]), 15, result)
+
+    def test_capture_returns_a_dict_whatever_the_platform(self):
+        result = screen.capture()
+        self.assertIsInstance(result["ok"], bool)
+        self.assertIn("message", result)
+
+
+class TestWakeWordEar(unittest.TestCase):
+    def setUp(self):
+        self.saved = wake.SETTINGS
+        wake.SETTINGS = type("S", (), {"wake_words": "jarvis,jervis", "wake_fuzzy": True,
+                                        "wake_followup_seconds": 12, "wake_command_key": "f12",
+                                        "wake_push_to_talk": "rcontrol", "bar_enabled": True,
+                                        "wake_enabled": True, "llm_budget_seconds": 25})()
+
+    def tearDown(self):
+        wake.SETTINGS = self.saved
+
+    def test_wake_words_are_parsed_and_deduped(self):
+        self.assertEqual(wake.wake_words()[:2], ("jarvis", "jervis"))
+
+    def test_utterances_addressed_to_jarvis_are_accepted(self):
+        for text in ("Jarvis, open spotify", "hey jarvis what time is it", "jervis pause the music",
+                     "JARVIS did you see that"):
+            self.assertTrue(wake.matches_wake(text), text)
+
+    def test_similar_looking_speech_is_rejected(self):
+        for text in ("open the jar lid", "can you harvest the wheat", "the service is down",
+                     "install java and python", "my favourite movie is jar"):
+            self.assertFalse(wake.matches_wake(text), text)
+
+    def test_strip_wake_leaves_only_the_command(self):
+        self.assertEqual(wake.strip_wake("jarvis, open spotify").lower(), "open spotify")
+        self.assertEqual(wake.strip_wake("open spotify"), "open spotify")
+
+    def test_the_energy_gate_finds_one_span_not_confetti(self):
+        # 0.45 s of dip mid-sentence is still one utterance; the 1.2 s tail closes the gate.
+        curve = [40.0] * 30 + [900.0] * 40 + [40.0] * 15 + [500.0] * 12 + [40.0] * 40
+        spans = wake.gate(curve)
+        self.assertEqual(len(spans), 1, spans)
+        start, end = spans[0]
+        self.assertLess(start, 30, "pre-roll must reach back before the trigger")
+        self.assertGreater(end, 85, "hysteresis must not chop the tail off a sentence")
+
+    def test_silence_is_gated_out(self):
+        self.assertEqual(wake.gate([20.0] * 200), [])
+        self.assertEqual(wake.gate([0.0] * 100), [])
+
+    def test_rms_measures_energy(self):
+        self.assertEqual(wake.rms(b""), 0.0)
+        self.assertEqual(wake.rms(b"\x00\x00" * 8), 0.0)
+        self.assertGreater(wake.rms(b"\xe8\x03" * 8), 900.0)
+
+    def test_the_listener_answers_without_a_microphone(self):
+        ok, why = wake.LISTENER.available()
+        self.assertIsInstance(ok, bool)
+        if not ok:
+            self.assertGreater(len(why), 10, "an unavailable ear must explain itself")
+        self.assertIn("running", wake.LISTENER.status())
+
+
+class TestReminders(unittest.TestCase):
+    def test_relative_spans_with_words_and_fractions(self):
+        base = datetime(2026, 9, 10, 12, 0, 0)
+        due, label, err = reminders.parse_when("in ten minutes", base)
+        self.assertEqual(err, "")
+        self.assertEqual(due, base.timestamp() + 600)
+        self.assertIn("min", label.lower())
+        self.assertEqual(reminders.parse_when("in an hour and a half", base)[0], base.timestamp() + 5400)
+        self.assertEqual(reminders.parse_when("in two hours", base)[0], base.timestamp() + 7200)
+
+    def test_clock_times_and_a_passed_time_means_tomorrow(self):
+        base = datetime(2026, 9, 10, 19, 0, 0)
+        due, label, err = reminders.parse_when("at 7:30 pm", base)
+        self.assertEqual(err, "", label)
+        self.assertEqual(due, datetime(2026, 9, 10, 19, 30).timestamp())
+        self.assertEqual(reminders.parse_when("at 7:30", base)[0],
+                         datetime(2026, 9, 11, 7, 30).timestamp())
+        self.assertEqual(reminders.parse_when("tomorrow at 9", base)[0],
+                         datetime(2026, 9, 11, 9, 0).timestamp())
+
+    def test_repeating_asks_are_accepted(self):
+        base = datetime(2026, 9, 10, 12, 0, 0)
+        due, label, err = reminders.parse_when("every day at 8am", base)
+        self.assertEqual(err, "", label)
+        self.assertGreater(due, base.timestamp())
+
+    def test_vague_words_have_a_documented_meaning(self):
+        base = datetime(2026, 9, 10, 12, 0, 0)
+        due, label, err = reminders.parse_when("in a bit", base)
+        self.assertEqual(err, "")
+        self.assertEqual(due, base.timestamp() + 300, "“in a bit” means five minutes, always")
+        due, label, err = reminders.parse_when("sometime", base)
+        self.assertIsNone(due)
+        self.assertIn("10 minutes", err)
+
+    def test_letters_inside_words_are_not_quantities(self):
+        base = datetime(2026, 9, 10, 12, 0, 0)
+        due, label, err = reminders.parse_when("every day at 8am", base)
+        self.assertEqual(err, "", label)
+        self.assertEqual(due, datetime(2026, 9, 11, 8, 0).timestamp(),
+                         "“every day at 8am” is tomorrow 08:00, not one minute from now")
+        self.assertIn("daily", label)
+        self.assertEqual(reminders.parse_when("in 20", base)[0], base.timestamp() + 1200,
+                         "a bare number after “in” is minutes")
+
+    def test_the_board_persists_snoozes_cancels_and_fires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "reminders.json"
+            fired = []
+            board = reminders.ReminderBoard(path=store, fire=fired.append)
+            now = time.time()
+            added = board.add("stretch", "in 5 minutes")
+            self.assertTrue(added["ok"], added)
+            self.assertIn("stretch", added["message"])
+            board.add("stand up", "in 1 minutes")
+            self.assertEqual(len(board.list()), 2)
+            self.assertTrue(store.is_file())
+            self.assertEqual(len(reminders.ReminderBoard(path=store).list()), 2)
+            first = board.list()[0]
+            self.assertLessEqual(first["due"] - now, 400)
+            self.assertEqual(board.due_now(), [], "nothing is due yet")
+            board.snooze("stretch", 30)
+            self.assertGreater(board.list()[-1]["due"], first["due"])
+            self.assertTrue(board.cancel("stand up")["ok"])
+            self.assertEqual(len(board.list()), 1)
+            board._items["now"] = reminders.Reminder(rid="now", text="check the download folder",
+                                                     due=time.time() - 1, run=True)
+            due = board.due_now()
+            self.assertEqual([item.rid for item in due], ["now"])
+            self.assertTrue(due[0].run, "an action item must be run, not only announced")
+            board._fire(due[0])
+            self.assertEqual(len(fired), 1)
+            self.assertEqual(len(board.list()), 1, "one-shots are dropped after firing")
+
+    def test_a_bad_time_is_reported_by_add(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            board = reminders.ReminderBoard(path=Path(tmp) / "r.json")
+            result = board.add("nothing", "")
+            self.assertFalse(result["ok"])
+            self.assertEqual(len(board.list()), 0)
+
+
+class TestDesktopWiring(unittest.TestCase):
+    """Wiring is where this round could break silently: schemas, registry, routes, assets."""
+
+    def test_registry_and_schema_list_agree(self):
+        names = set(router.TOOL_NAMES)
+        self.assertEqual(names, set(tools.TOOL_FUNCTIONS), "every tool needs a schema and a function")
+        documented = {spec["function"]["name"] for spec in router.TOOL_SCHEMAS}
+        self.assertEqual(documented, names)
+        for name in ("manage_files", "control_desktop", "read_screen", "set_reminder", "focus_app",
+                     "list_apps", "windows_on_screen", "listening", "launch_app", "close_app"):
+            self.assertIn(name, names)
+
+    def test_the_new_tools_answer_through_execute_tool(self):
+        for call in (("list_apps", {"query": ""}), ("manage_files", {"action": "list"}),
+                     ("set_reminder", {"action": "list"}), ("listening", {"status": "status"}),
+                     ("windows_on_screen", {}), ("read_screen", {"action": "read", "count": "2"})):
+            result = tools.execute_tool(call[0], call[1])
+            self.assertIn("ok", result, call)
+            self.assertGreater(len(str(result.get("message", ""))), 3, call)
+        self.assertFalse(tools.execute_tool("manage_files", {"action": "list", "path": "no/such/dir-91827364"})["ok"])
+
+    def test_an_invented_action_is_rejected_before_anything_runs(self):
+        tool, args, error = router.validate_call("manage_files", {"action": "format-hard-drive"})
+        self.assertIsNone(tool)
+        self.assertIn("not allowed", error)
+        tool, args, error = router.validate_call("control_desktop", {"action": "reboot-everything"})
+        self.assertIsNone(tool)
+        self.assertTrue(error)
+
+    def test_instant_rules_cover_the_new_powers(self):
+        cases = {
+            "create a file called ideas.md with milk and eggs": ("files-say", "manage_files"),
+            "delete notes.txt": ("files-delete", "manage_files"),
+            "read shopping.txt": ("files-read", "manage_files"),
+            "list my files": ("files-list", "manage_files"),
+            "undo that": ("files-undo", "manage_files"),
+            "what am I looking at": ("screen-read", "read_screen"),
+            "read out top three results": ("screen-top", "read_screen"),
+            "type hello world into the search box": ("desktop-type", "control_desktop"),
+            "type \"hello world\"": ("desktop-type", "control_desktop"),
+            "press escape": ("desktop-press", "control_desktop"),
+            "minimize": ("desktop-window", "control_desktop"),
+            "remind me to stretch in ten minutes": ("remind-add", "set_reminder"),
+            "cancel the timer": ("remind-cancel", "set_reminder"),
+            "start listening": ("listening", "listening"),
+            "list apps": ("apps-ask", "list_apps"),
+            "switch to spotify": ("focus-app", "focus_app"),
+        }
+        for text, (rule, tool) in cases.items():
+            plan = server.match_instant(text)
+            self.assertIsNotNone(plan, text)
+            self.assertEqual(plan.get("rule"), rule, text)
+            self.assertEqual(plan["calls"][0]["tool"], tool, text)
+
+    def test_a_chained_open_plus_read_is_not_hijacked(self):
+        plan = server.match_instant("open google and read the top 3 results")
+        self.assertEqual((plan or {}).get("rule"), "open", plan)
+
+    def test_a_poem_is_not_mistaken_for_a_file(self):
+        self.assertNotEqual((server.match_instant("write a poem about rain") or {}).get("rule"), "files-say")
+
+    def test_a_delete_outside_the_granted_roots_asks_first(self):
+        with _FileSandbox():
+            outside = Path(files.roots()[0]).parent.parent / "payroll.csv"
+            outside.write_text("salaries", encoding="utf-8")
+            try:
+                plan = server.match_instant(f"delete {outside}")
+                self.assertTrue(plan.get("confirm"), plan)
+                self.assertIn("Recycle Bin", plan["confirm"])
+            finally:
+                outside.unlink(missing_ok=True)
+
+    def test_a_delete_inside_the_jarvis_folder_just_happens(self):
+        with _FileSandbox() as root:
+            (root / "scratch.txt").write_text("temporary", encoding="utf-8")
+            plan = server.match_instant("delete scratch.txt")
+            self.assertIsNone(plan.get("confirm"), plan)
+            self.assertEqual(plan["calls"][0]["tool"], "manage_files")
+
+    def test_reminders_fire_through_the_command_funnel(self):
+        self.assertTrue(callable(server.queue_spoken_command))
+        self.assertFalse(server.queue_spoken_command("")["ok"])
+
+    def test_desktop_endpoints_are_served(self):
+        if not HTTP_OK:
+            self.skipTest("httpx not installed")
+        client = TestClient(server.create_app())
+        for path in ("/api/desktop", "/api/reminders", "/api/status"):
+            self.assertEqual(client.get(path).status_code, 200, path)
+        self.assertTrue(client.get("/api/desktop").json()["ok"])
+        response = client.post("/api/bar", json={"action": "toggle"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(bool(response.json()["ok"]), bool(getattr(config, "BAR_CONTROLLER", None)))
+        self.assertEqual(client.post("/api/listening", json={"action": "status"}).status_code, 200)
+        self.assertEqual(client.get("/bar").status_code, 200)
+
+    def test_the_bar_assets_really_wire_the_core(self):
+        html = (config.ROOT / "static" / "bar.html").read_text(encoding="utf-8")
+        script = (config.ROOT / "static" / "bar.js").read_text(encoding="utf-8")
+        for needle in ("/api/command", "/api/listen", "/api/listening", "/api/bar"):
+            self.assertIn(needle, script, needle)
+        self.assertIn("bar.js", html)
+        self.assertNotIn("TODO", html + script)
+        source = (config.ROOT / "main.py").read_text(encoding="utf-8")
+        for needle in ("BAR_CONTROLLER", "start_background_ear", "frameless=True", "on_top=True"):
+            self.assertIn(needle, source, needle)
+
+    def test_the_ladder_only_sends_images_to_vision_models(self):
+        status = llm_providers.POOL.status()
+        for row in status.get("providers", []):
+            self.assertIn("vision_models", row, row.get("name"))
+        source = (config.ROOT / "llm_providers.py").read_text(encoding="utf-8")
+        self.assertIn("def vision(", source)
+        self.assertIn("no image input on this API style", source)
+        self.assertIn("input_modalities", source)
+
+    def test_the_offline_planner_routes_the_new_tools(self):
+        for text, tool in (("what am I looking at", "read_screen"),
+                           ("remind me to call mom in twenty minutes", "set_reminder"),
+                           ("undo that", "manage_files"),
+                           ("open bluetooth settings", "launch_app"),
+                           ("read out the top 5 listings", "read_screen"),
+                           ("what windows are open right now", "windows_on_screen"),
+                           ("delete the file called ideas.md", "manage_files")):
+            calls = router.heuristic_plan(text, allow_search=False)
+            self.assertTrue(any(c["tool"] == tool for c in calls), (text, calls))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

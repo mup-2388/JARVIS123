@@ -147,6 +147,22 @@
         </p>
       </section>
 
+      <section class="hud-panel rounded-xl border border-cyan-500/30 bg-white/10 p-3 backdrop-blur-md" id="desktop-panel">
+        <div class="flex items-center justify-between gap-2">
+          <h2 class="panel-title">Hands &amp; ears</h2>
+          <div class="flex shrink-0 items-center gap-1.5 font-mono text-[9px] uppercase tracking-widest text-cyan-300/60">
+            <span id="desktop-screen" class="chip chip-mini" title="screen reading capability">screen &mdash;</span>
+            <button id="btn-ear" class="chip chip chip-mini" title="start or stop the always-on wake-word ear">ear &mdash;</button>
+            <button id="btn-bar" class="chip chip chip-mini" title="show or hide the floating prompt bar">bar</button>
+          </div>
+        </div>
+        <p id="desktop-summary" class="mt-2 font-mono text-[9.5px] leading-snug text-cyan-100/55">
+          checking what this machine lets me touch&hellip;
+        </p>
+        <p id="desktop-roots" class="mt-1 font-mono text-[9px] leading-snug text-cyan-100/40" title="folders I may read and write">
+          files: &mdash;
+        </p>
+      </section>
       <section class="hud-panel flex min-h-0 flex-1 flex-col rounded-xl border border-cyan-500/30 bg-white/10 p-3 backdrop-blur-md">
         <h2 class="panel-title">Top processes</h2>
         <ul id="proc-list" class="mt-2 min-h-0 flex-1 space-y-1 overflow-y-auto font-mono text-[10px] text-cyan-100/80"></ul>

@@ -38,6 +38,29 @@ from urllib import request as _urlrequest
 import config
 from config import SETTINGS, get_logger
 
+# The desktop-control layers.  Each one degrades to an ``{ok: False, message}`` dict when the
+# platform cannot provide it, so importing tools never fails on a non-Windows dev box.
+try:
+    import apps as _apps
+except Exception:  # noqa: BLE001 - a broken helper must never take the whole tool layer down
+    _apps = None
+try:
+    import files as _files
+except Exception:  # noqa: BLE001
+    _files = None
+try:
+    import screen as _screen
+except Exception:  # noqa: BLE001
+    _screen = None
+try:
+    import winops as _winops
+except Exception:  # noqa: BLE001
+    _winops = None
+try:
+    import reminders as _reminders
+except Exception:  # noqa: BLE001
+    _reminders = None
+
 log = get_logger("tools")
 
 _OK = "ok"
@@ -368,6 +391,9 @@ def _match_catalog_app(query: str) -> Optional[str]:
 
 
 def is_known_app(name: str) -> bool:
+    """Also true when :mod:`apps` can resolve the name from the Start Menu or registry."""
+    if _apps is not None and _apps.resolve(name) is not None:
+        return True
     """True when :func:`launch_app` has a realistic chance of resolving ``name``.
 
     Track 1 uses this as a precision gate: it only claims an "open X" utterance
@@ -411,109 +437,292 @@ def _pid_names(process: str) -> List[int]:
 
 
 def launch_app(app_name: str, url: str = "", args: str = "") -> Dict[str, Any]:
-    """Launch a standard Windows application (Steam, Discord, Eden/FC 26, browsers…).
+    """Launch *any* app the user can name, resolved by :mod:`apps`.
 
-    Resolution order (fastest + most reliable first):
-
-    1. protocol handler / URI scheme  (``steam://``, ``ms-settings:``, ``https://``)
-    2. known install path or ``CUSTOM_APPS`` override
-    3. Windows uninstall-registry lookup (any drive, any version)
-    4. ``PATH`` lookup via :func:`shutil.which`
-    5. ``cmd /c start`` shell fallback (honours user defaults / UWP aliases)
-
-    ``url`` opens the browser straight at a target (used by Track 1's
-    "open youtube and play lofi"), ``args`` appends CLI flags.
+    Settings (``ms-settings:``), Microsoft Teams (MSIX package id), Control Panel applets,
+    Start-menu shortcuts, registry installs on other drives and the user's own ``CUSTOM_APPS``
+    entries all resolve here, and every one of them is started with ``ShellExecuteW`` - the
+    call Explorer makes - because ``CreateProcess`` cannot launch a protocol URI, which is
+    precisely why "open settings" used to fail.
     """
-    app_name = (app_name or "").strip()
-    if not app_name:
-        return {"ok": False, "message": "Which application should I launch?"}
+    if _apps is None:
+        return {"ok": False, "message": "The app resolver is unavailable on this install."}
+    outcome = _apps.launch(app_name, url=url, args=args)
+    if not outcome.get("ok") and outcome.get("did_you_mean"):
+        outcome["message"] = str(outcome.get("message", "")) + (
+            " Say the name again exactly and I'll use it.")
+    return outcome
 
-    key = _match_catalog_app(app_name) or _slug(app_name)
-    meta = dict(APP_CATALOG.get(key) or _custom_apps().get(key) or {})
-    display = meta.get("display") or app_name.title()
-    if key == _slug(app_name) and not meta:
-        # Unknown app -> still try hard before giving up.
-        meta = {"aliases": {app_name.lower()}, "uri": "", "paths": [], "process": ""}
 
-    tried: List[str] = []
+def focus_app(name: str) -> Dict[str, Any]:
+    """Bring an already-running app to the front instead of opening a second window."""
+    if _apps is None:
+        return {"ok": False, "message": "The app resolver is unavailable on this install."}
+    return _apps.focus(name)
 
-    # ---- 1. URI / protocol handler -----------------------------------------
-    uri = str(meta.get("uri", "")).strip()
-    if uri:
-        uri = uri.replace("{url}", url or "").replace("{cwd}", str(config.ROOT))
-        if " " in uri and not uri.lower().startswith(("http://", "https://")):
-            # e.g. "start chrome" -- shell form
-            shell_cmd: List[str] = (
-                ["cmd", "/c", uri] if config.is_windows() else ["sh", "-c", uri.replace("start ", "xdg-open ")]
-            )
-            code, out, err = _run(shell_cmd, timeout=SETTINGS.launch_timeout)
-            tried.append(f"shell:{uri}")
-            if code == 0:
-                return {"ok": True, "message": f"{display} launched.", "app": key, "method": "shell", "tried": tried}
-            uri = ""  # fall through to path resolution
 
-        if uri.lower().startswith(("http://", "https://")):
-            target = uri if not url else uri
-            opened = _open_url(target)
-            if opened["ok"]:
-                return {**opened, "app": key, "message": f"Opening {display} at {target}.", "tried": tried}
-            tried.append(f"url:{target}")
-        else:
-            code, _, err = _run([uri] + ([args] if args else []), timeout=SETTINGS.launch_timeout)
-            tried.append(f"uri:{uri}")
-            if code == 0:
-                return {"ok": True, "message": f"{display} launched.", "app": key, "method": "uri", "tried": tried}
+def list_apps(query: str = "") -> Dict[str, Any]:
+    """Everything installed that JARVIS can launch (also the source of "did you mean")."""
+    if _apps is None:
+        return {"ok": False, "message": "The app resolver is unavailable.", "apps": []}
+    return _apps.installed(query=query)
 
-    # ---- 2. explicit paths (catalog + CUSTOM_APPS) -------------------------
-    for raw in meta.get("paths", []):
-        candidate = _expand(raw)
-        if candidate and Path(candidate).is_file():
-            return _spawn(candidate, args, display, f"path:{candidate}", tried)
 
-    # ---- 3. registry -------------------------------------------------------
-    if config.is_windows():
-        display_hints = {display.lower()} | {a.lower() for a in meta.get("aliases", set())}
-        for reg_name, entry in _registry_installs().items():
-            rn = _norm(reg_name)
-            if not any(a and (a in rn or rn in a) for a in display_hints):
-                continue
-            exe = _exe_from_uninstall(entry)
-            if exe and Path(exe).is_file():
-                return _spawn(exe, args, reg_name, f"registry:{reg_name}", tried)
+def windows_on_screen(limit: str = "") -> Dict[str, Any]:
+    """The open windows, with the focused one marked - "what am I looking at", cheaply."""
+    if _winops is None:
+        return {"ok": False, "message": "Window listing needs the desktop layer."}
+    rows = _winops.windows()
+    try:
+        count = max(1, min(int(limit or 12), 40))
+    except (TypeError, ValueError):
+        count = 12
+    front = _winops.foreground_window()
+    lines = [f"{str(r.get('title', ''))[:64]} [{r.get('process', '?')}]" for r in rows[:count]]
+    return {"ok": True,
+            "message": (f"Focused: “{front.get('title', '')}”. " if front.get("ok") else "")
+                       + (f"{len(rows)} windows open: " + "; ".join(lines[:8]) if rows
+                          else "No windows could be listed here."),
+            "focused": str(front.get("title", "")) if front.get("ok") else "",
+            "windows": [{"title": str(r.get("title", "")), "process": str(r.get("process", "")),
+                         "minimized": bool(r.get("minimized"))} for r in rows[:count]],
+            "count": len(rows)}
 
-    # ---- 4. PATH ------------------------------------------------------------
-    for guess in {meta.get("process", ""), f"{key}.exe", key, Path(key).name}:
-        if not guess:
-            continue
-        found = shutil.which(guess)
-        if found:
-            return _spawn(found, args, display, f"which:{guess}", tried)
 
-    # ---- 5. shell fallback --------------------------------------------------
-    if config.is_windows():
-        code, _, err = _run(["cmd", "/c", "start", "", app_name], timeout=SETTINGS.launch_timeout)
-        tried.append("start:shell")
-        if code == 0:
-            return {"ok": True, "message": f"Asking Windows to open {display}.", "app": key, "method": "start", "tried": tried}
-        code, _, err = _run(["cmd", "/c", f"start shell:AppsFolder {app_name}"], timeout=SETTINGS.launch_timeout)
-        tried.append("AppsFolder")
-        if code == 0:
-            return {"ok": True, "message": f"Launching {display} from Start menu.", "app": key, "method": "AppsFolder", "tried": tried}
-    else:
-        code, _, err = _run(["xdg-open", app_name.lower()], timeout=SETTINGS.launch_timeout)
-        tried.append("xdg-open")
-        if code == 0:
-            return {"ok": True, "message": f"Launching {display}.", "app": key, "method": "xdg-open", "tried": tried}
+# --------------------------------------------------------------------------- files, as one tool
+_FILE_ACTIONS = {"list", "read", "write", "append", "overwrite", "delete", "search", "find",
+                 "move", "copy", "rename", "mkdir", "note", "undo", "disk", "open", "script",
+                 "run", "recent"}
 
-    return {
-        "ok": False,
-        "message": (
-            f"I could not find {display} on this machine. "
-            f"Add it to CUSTOM_APPS in .env as {display}=C:\\path\\to\\{display.lower()}.exe and I will remember it."
-        ),
-        "app": key,
-        "tried": tried,
-    }
+
+def manage_files(action: str = "list", path: str = "", content: str = "", destination: str = "",
+                 query: str = "", text: str = "", confirm: str = "", run: str = "",
+                 language: str = "", limit: str = "") -> Dict[str, Any]:
+    """Create, read, change, search and remove files - journal-first, Recycle-Bin only.
+
+    Safety, in this order: writes are confined to ``FILES_ROOT`` (+ ``FILES_ALLOWED``); a
+    path outside them comes back as ``needs_confirmation`` with a token instead of happening;
+    every overwrite copies the old bytes to ``data/file_backups`` first, and every delete
+    copies to ``data/file_trash`` before the Recycle Bin, so ``undo`` always has something to
+    restore.  ``script`` + ``run`` executes code JARVIS just wrote, with its output returned.
+    """
+    if _files is None:
+        return {"ok": False, "message": "The file layer is unavailable on this install."}
+    action = (action or "list").strip().lower()
+    if action not in _FILE_ACTIONS:
+        return {"ok": False, "message": f"I don't have a file action “{action}”. Try: "
+                                       + ", ".join(sorted(_FILE_ACTIONS)) + "."}
+    try:
+        cap = int(limit) if str(limit or "").strip() else 20
+    except (TypeError, ValueError):
+        cap = 20
+    if action == "list":
+        return _files.list_dir(path, sort=text or "name", limit=cap)
+    if action == "read":
+        return _files.read(path)
+    if action in ("write", "create"):
+        return _files.write(path, content or text, mode="create" if action == "write" else "create",
+                            confirm=confirm)
+    if action == "overwrite":
+        return _files.write(path, content or text, mode="overwrite", confirm=confirm)
+    if action == "append":
+        return _files.write(path, content or text, mode="append", confirm=confirm)
+    if action == "delete":
+        return _files.delete(path, confirm=confirm)
+    if action in ("search", "find"):
+        return _files.search(name=query or path, contains=text or content, root=path if query else "",
+                             limit=cap)
+    if action == "move":
+        return _files.move(path, destination=destination)
+    if action == "copy":
+        return _files.move(path, destination=destination, copy="yes")
+    if action == "rename":
+        return _files.move(path, rename=destination or text)
+    if action == "mkdir":
+        return _files.mkdir(path or text)
+    if action == "note":
+        return _files.note(query or path or "note", text or content)
+    if action == "undo":
+        return _files.undo(cap)
+    if action == "disk":
+        return _files.disk_report(path)
+    if action == "open":
+        return _files.open_file(path, select=text)
+    if action == "script":
+        return _files.script(path or query or "script", language or "python", content or text, run=run or "no")
+    if action == "run":
+        return _files.execute_script(path, language or "python")
+    return _files.recent(cap)
+
+
+# --------------------------------------------------------------------------- desktop, as one tool
+def control_desktop(action: str = "type", text: str = "", keys: str = "", combo: str = "",
+                    x: str = "", y: str = "", button: str = "left", amount: str = "",
+                    level: str = "", path: str = "") -> Dict[str, Any]:
+    """Keyboard, mouse, windows, clipboard, volume, media, wallpaper, notifications.
+
+    Real ``SendInput`` events through :mod:`winops` (no pywin32), so this drives whatever has
+    focus - the same keys the user would press.  Typing long text goes via the clipboard +
+    Ctrl+V because it is faster and cannot mangle case; the clipboard is restored afterwards.
+    """
+    if _winops is None:
+        return {"ok": False, "message": "The desktop layer is unavailable on this install."}
+
+    def num(value: str, default: int = 0) -> int:
+        try:
+            return int(str(value).strip() or default)
+        except (TypeError, ValueError):
+            return default
+
+    action = (action or "type").strip().lower()
+    if action in {"type", "write", "text"}:
+        return _winops.type_text(text, press_enter="yes" if text.strip().lower().endswith("\n") else "")
+    if action == "press":
+        return _winops.press(keys or text, times=max(1, num(amount, 1)))
+    if action in {"hotkey", "shortcut", "combo"}:
+        return _winops.hotkey(combo or keys or text)
+    if action in {"click", "doubleclick", "double", "rightclick", "right-click"}:
+        double = "yes" if action in {"doubleclick", "double"} else ""
+        return _winops.click(num(x, -1), num(y, -1),
+                             button="right" if action in {"rightclick", "right-click"} else (button or "left"),
+                             clicks=max(1, num(amount, 1)), double=bool(double))
+    if action in {"move", "move_mouse"}:
+        return _winops.move_mouse(num(x, 0), num(y, 0))
+    if action in {"scroll", "scroll_down", "scroll_up"}:
+        steps = num(amount, 3)
+        return _winops.scroll(-steps if action != "scroll_up" else steps, num(x, -1), num(y, -1))
+    if action in {"minimize", "maximize", "restore", "hide_window"}:
+        front = _winops.foreground_window()
+        if not front.get("ok"):
+            return {"ok": False, "message": front.get("message", "No focused window.")}
+        state = {"minimize": "minimize", "hide_window": "hide"}.get(action, action)
+        return _winops.show_window(front.get("hwnd"), state)
+    if action in {"focus", "activate", "bring_to_front", "alt_tab"}:
+        if _apps is not None and text:
+            return _apps.focus(text)
+        return _winops.activate(title=text or keys)
+    if action == "list_windows":
+        return windows_on_screen(amount)
+    if action in {"clipboard", "clipboard_read", "paste_board"}:
+        return _winops.clipboard_read()
+    if action == "clipboard_write":
+        return _winops.clipboard_write(text)
+    if action == "volume":
+        verb = (text or "get").strip().lower()
+        if verb.startswith(("up", "down", "set", "mute", "unmute", "get")):
+            return _winops.volume(verb, level=num(level or amount, -1))
+        return _winops.volume("set", level=num(verb, num(level or amount, 50)))
+    if action in {"media", "music"}:
+        return _winops.media(text or keys or "playpause")
+    if action == "screenshot":
+        return _winops.screenshot(path=path)
+    if action == "lock":
+        return _winops.lock_workstation()
+    if action == "wallpaper":
+        return _winops.set_wallpaper(path or text)
+    if action in {"notify", "toast", "remind_later"}:
+        return _winops.notify(text or "JARVIS", path or "")
+    if action in {"battery", "power_status"}:
+        return _winops.battery()
+    if action in {"processes", "top_processes"}:
+        rows = _winops.process_list()[:max(1, num(amount, 10))]
+        return {"ok": True, "message": "Running now: " + ", ".join(
+            f"{r['name']} ({r['memory_mb']:.0f} MB)" for r in rows[:8]), "processes": rows}
+    if action in {"open_folder", "show_in_folder"}:
+        return _winops.open_folder(path, select=text)
+    if action == "beep":
+        return _winops.beep(max(1, num(amount, 1)))
+    return {"ok": False, "message": f"Unknown desktop action “{action}”."}
+
+
+# --------------------------------------------------------------------------- eyes
+def read_screen(action: str = "read", count: str = "3", question: str = "",
+                target: str = "screen", save_to: str = "") -> Dict[str, Any]:
+    """Look at the display: OCR it locally, list the top N items, or ask a vision model.
+
+    ``read``/``list`` stay on the machine (Windows OCR, then Tesseract).  ``describe`` sends the
+    capture to a provider model whose ``input_modalities`` include images - so on a Groq key
+    that can see ``qwen3.x-27b`` but not a vision gpt-oss, it uses the right one and never
+    400s on a text-only id.
+    """
+    if _screen is None:
+        return {"ok": False, "message": "The screen layer is unavailable on this install."}
+    action = (action or "read").strip().lower()
+    try:
+        want = max(1, min(int(count or 3), 10))
+    except (TypeError, ValueError):
+        want = 3
+    if action in {"capture", "screenshot", "shot"}:
+        return _screen.capture(target=target)
+    if action in {"read", "ocr", "text"}:
+        return _screen.ocr()
+    if action in {"list", "top", "results", "listings"}:
+        return _screen.read_screen(count=want, target=target)
+    if action in {"describe", "what", "look", "explain"}:
+        return _screen.describe(question=question, target=target)
+    if action in {"window", "windows", "focused"}:
+        return _screen.window_text()
+    if action in {"save", "note"}:
+        return _screen.save_note_from_screen(question, to=save_to)
+    return {"ok": False, "message": f"Unknown screen action “{action}”: capture, read, list, "
+                                   "describe, window or save."}
+
+
+# --------------------------------------------------------------------------- time-based actions
+def set_reminder(action: str = "add", text: str = "", when: str = "", minutes: str = "",
+                 run: str = "") -> Dict[str, Any]:
+    """Timers, reminders and scheduled commands, persisted across restarts.
+
+    ``when`` takes whatever the user actually said ("in ten minutes", "at 7:30 pm", "tomorrow at
+    9", "every 2 hours"); ``parse_when`` resolves it, including a clock time that has passed
+    meaning tomorrow.  ``run`` marks the text as a *command* to execute at that time rather than
+    a note to read out.
+    """
+    if _reminders is None:
+        return {"ok": False, "message": "The reminder layer is unavailable on this install."}
+    action = (action or "add").strip().lower()
+    try:
+        span = int(str(minutes or "").strip() or 10)
+    except (TypeError, ValueError):
+        span = 10
+    when = when or (f"in {span} minutes" if span else "")
+    if action in {"add", "set", "remind", "timer"}:
+        return _reminders.BOARD.add(text=text or when, when=when, run=bool(run.strip()))
+    if action in {"list", "show"}:
+        rows = _reminders.BOARD.list()
+        if not rows:
+            return {"ok": True, "message": "You have nothing scheduled.", "reminders": []}
+        return {"ok": True, "message": "Scheduled: " + "; ".join(
+            f"{r['text'] or 'note'} {r.get('due_iso') or ''}" for r in rows[:6]), "reminders": rows}
+    if action in {"cancel", "remove", "clear"}:
+        return _reminders.BOARD.cancel(text or when)
+    if action == "snooze":
+        return _reminders.BOARD.snooze(text, span)
+    return {"ok": False, "message": f"Unknown reminder action “{action}”: add, list, cancel or snooze."}
+
+
+# --------------------------------------------------------------------------- background ear
+def listening(status: str = "status") -> Dict[str, Any]:
+    """Report or change background wake-word listening (the always-on ear)."""
+    try:
+        import wake
+
+        listener = wake.LISTENER
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"The background listener is unavailable: {exc}"}
+    action = (status or "status").strip().lower()
+    if action in {"start", "on", "enable"}:
+        return listener.start()
+    if action in {"stop", "off", "disable"}:
+        return listener.stop()
+    if action in {"talk", "listen", "record"}:
+        return listener.record_once(seconds=5)
+    data = listener.status()
+    return {"ok": bool(data.get("running")),
+            "message": ("Listening for " + "/".join(data.get("wake_words") or ["jarvis"])
+                        if data.get("running") else
+                        f"Background listening is off: {data.get('detail') or 'not started'}"),
+            "status": data}
 
 
 def _spawn(exe: str, args: str, display: str, method: str, tried: List[str]) -> Dict[str, Any]:
@@ -541,38 +750,10 @@ def _spawn(exe: str, args: str, display: str, method: str, tried: List[str]) -> 
 
 
 def close_app(app_name: str) -> Dict[str, Any]:
-    """Terminate an application by resolved process name (graceful, then forced)."""
-    key = _match_catalog_app(app_name) or _slug(app_name)
-    meta = APP_CATALOG.get(key) or _custom_apps().get(key) or {}
-    names: List[str] = []
-    for guess in (meta.get("process", ""), f"{key}.exe"):
-        if guess and guess not in names:
-            names.append(guess)
-    if not names:
-        names.append(f"{key}.exe")
-
-    try:
-        import psutil
-    except Exception:
-        return {"ok": False, "message": "psutil is required to close applications."}
-
-    killed: List[str] = []
-    for proc in psutil.process_iter(["pid", "name"]):
-        try:
-            pname = (proc.info["name"] or "").lower()
-            if any(pname == n.lower() or pname.startswith(n.lower().removesuffix(".exe")) for n in names):
-                proc.terminate()
-                try:
-                    proc.wait(timeout=4)
-                except Exception:
-                    proc.kill()
-                killed.append(f"{proc.info['name']}({proc.info['pid']})")
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    if killed:
-        return {"ok": True, "message": f"Closed {', '.join(killed)}.", "killed": killed}
-    return {"ok": False, "message": f"{app_name} was not running.", "looked_for": names}
-
+    """Close an app by resolved process name (Start menu, registry or catalogue)."""
+    if _apps is not None:
+        return _apps.close(app_name)
+    return {"ok": False, "message": "The app resolver is unavailable on this install."}
 
 def list_launchable_apps() -> Dict[str, Any]:
     """Names JARVIS can launch right now (catalog + custom + registry)."""
@@ -1764,6 +1945,14 @@ TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "system_power": system_power,
     "search_on_site": search_on_site,
     "llm_status": llm_status,
+    "focus_app": focus_app,
+    "list_apps": list_apps,
+    "windows_on_screen": windows_on_screen,
+    "manage_files": manage_files,
+    "control_desktop": control_desktop,
+    "read_screen": read_screen,
+    "set_reminder": set_reminder,
+    "listening": listening,
 }
 
 
@@ -1796,6 +1985,14 @@ __all__ = [
     "TOOL_FUNCTIONS",
     "launch_app",
     "close_app",
+    "focus_app",
+    "list_apps",
+    "windows_on_screen",
+    "manage_files",
+    "control_desktop",
+    "read_screen",
+    "set_reminder",
+    "listening",
     "list_launchable_apps",
     "is_known_app",
     "open_website",

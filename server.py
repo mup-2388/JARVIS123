@@ -50,7 +50,7 @@ import tools
 from audio_engine import ENGINE as voice
 from audio_engine import TARGET_SR
 from config import SETTINGS, get_logger
-from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -663,7 +663,270 @@ def _rule_wake(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
     return _say(f"Warming up: speech-to-text {threading_warm['stt']}, voice {threading_warm['tts']}.")
 
 
+# --------------------------------------------------------------------------- hands
+#: The desktop powers get their own instant rules, because "delete old.txt" or "what am I
+#: looking at" is exactly the kind of sentence a model should not have to burn three seconds
+#: on - and when no provider answers at all, these still work.
+_FILE_SAY_RE = re.compile(
+    # The name is lazy, so the separator (``with``/``:``/``that says``) has to be what stops it;
+    # the "$" branch is what makes "create a file called ideas.md" work with no body at all.
+    r"^(?:please )?(?:create|make|write|new)(?: a| me a| up a)?\s+(?:new\s+)?"
+    r"(?:(?:text|txt|markdown|md|python|py|csv|json|html|js|script|file|document|doc|folder|directory)\s+)?"
+    r"(?:called|named|titled)?\s*['\"]?(?P<name>[\w\- .()]{2,60}?)[\"']?\s*"
+    r"(?:$(?P<body>)|(?:(?:with that says|that says|containing|with|:)\s*(?P<body2>.{1,900}?)\s*$))",
+    re.I,
+)
+_FILE_DELETE_RE = re.compile(
+    # Spoken English pads this one three ways - "delete payroll.csv", "remove the file called x",
+    # "get rid of my old notes".  The name class is lazy so the optional tail forces it to stop.
+    r"^(?:please )?(?:delete|remove|erase|trash|get rid of)\s+(?:the\s+|my\s+|this\s+|that\s+|a\s+|an\s+)?"
+    r"(?:file\s+|folder\s+|document\s+|doc\s+)?(?:called\s+|named\s+|titled\s+)?\x27?\x22?"
+    r"(?P<name>[\w\- .()\\/]{2,60}?)\x27?\x22?\s*(?:please|for me|now|thanks)?$",
+    re.I,
+)
+
+_FILE_READ_RE = re.compile(
+    r"^(?:please )?(?:read|open the file|what(?:'s| is) in|summar(?:ise|ize)|check the file)\s+"
+    r"(?:the\s+|my\s+)?(?:file|doc(?:ument)?)?\s*['\"]?(?P<name>[\w\- .()\\/]{2,60})['\"]?[?.]*$",
+    re.I,
+)
+_FILE_LIST_RE = re.compile(
+    r"^(?:please )?(?:list|show)(?: me)? (?:my|the) (?:files|folder|documents|downloads|notes)(?: in \S+)?[?.]*$",
+    re.I,
+)
+_FILE_SEARCH_RE = re.compile(
+    r"^(?:please )?(?:find|search for) (?:a |my )?files? (?:named |with |called )?['\"]?(?P<name>[\w\- .*()]{2,50})",
+    re.I,
+)
+_FILE_UNDO_RE = re.compile(r"^undo (?:that|it|the last (?:file )?(?:change|delete|write)|the delete)\b", re.I)
+_SCREEN_READ_RE = re.compile(
+    r"^(?:jarvis[ ,]+)?(?:what am i looking at|what(?:'s| is) on (?:my|the) screen|read (?:my|the) screen|"
+    r"describe (?:the|my) screen|look at (?:my|the) screen|what do you see)[?.]*$",
+    re.I,
+)
+_SCREEN_TOP_RE = re.compile(
+    r"\b(?:read (?:out )?|tell me (?:the )?|top |first )(?P<n>\d{1,2}|one|two|three|four|five)\s+"
+    r"(?:results?|listings?|items?|links?|products?|offers?|entries?)[?.]*$",
+    re.I,
+)
+_DESKTOP_TYPE_RE = re.compile(
+    # A dictated sentence arrives with no quotes, so the unquoted form has to work too - but only
+    # for "type" ("write a poem about rain" is composition, not keystrokes) and never when the
+    # object is something to author.  “into the search box” is accepted and ignored: we type into
+    # whatever holds the caret, which is the entire point of the overlay.
+    r"^(?:please )?(?:type|write)\s+[\x22\x27](?P<textq>.{1,400}?)[\x22\x27][?.]*$"
+    r"|^(?:please )?type\s+(?!\s*(?:a|an|the|my|our|his|her|their|this|that|these|those)\b)"
+    r"(?P<text>.{1,300}?)(?:\s+into\s+(?:the|my|your)\s+[\w\x27 -]{1,28})?[?.]*$",
+    re.I,
+)
+
+_DESKTOP_KEY_RE = re.compile(
+    r"^(?:please )?(?:press|hit|tap)\s+(?P<key>escape|enter|return|tab|space|backspace|delete|"
+    r"f\d{1,2}|(?:down|up|left|right) arrow)(?:\s+(\d{1,2}) times)?[?.]*$", re.I)
+_DESKTOP_WIN_RE = re.compile(
+    r"^(?:please )?(?P<action>minimi[sz]e|maximi[sz]e|restore|hide)(?: this| the current| the active)?"
+    r"\s*(?:window|app)?\s*(?:now|please)?[?.]*$", re.I)
+_FOCUS_APP_RE = re.compile(
+    r"^(?:please )?(?:switch to|go back to|focus|look at|bring up)\s+(?:the\s+|my\s+)?"
+    r"(?P<app>[a-z][a-z0-9 .'_&-]{1,32}?)\s*(?:window|app|please|now)?$", re.I)
+_APPS_ASK_RE = re.compile(r"^(?:what|list|show)(?: apps| can i open)? (?:can i open|do i have|installed)[?.]*$|"
+                          r"^(?:list|show)(?: me)? (?:the |my )?apps[?.]*$", re.I)
+_REMIND_ADD_RE = re.compile(
+    r"^(?:please )?(?:remind me|set a? ?(?:timer|alarm)|alert me)(?: to| that| about| for)?\s+"
+    r"(?P<what>.{0,140}?)\s*(?P<when>in\s+[\w ]{2,32}|at\s+[\w :]{2,20}|tomorrow[\w ]{0,24}|"
+    r"tonight[\w ]{0,24}|every\s+[\w ]{2,24})\s*$",
+    re.I,
+)
+_REMIND_TIMER_RE = re.compile(r"^set (?:a )?timer for\s+(?P<when>[\w ]{2,32})[?.]*$", re.I)
+_REMIND_LIST_RE = re.compile(r"^(?:what(?:'s| is) (?:on|my) (?:schedule|reminders|timers)|list (?:my )?reminders)[?.]*$", re.I)
+_REMIND_CANCEL_RE = re.compile(
+    r"^cancel (?:the |my )?(?:timer|reminder|alarm)(?:\s+(?:about|for|to)\s+(?P<what>.{2,60}))?\s*$", re.I)
+_LISTENING_RE = re.compile(
+    r"^(?:start|stop|enable|disable) (?:background )?(?:listening|the ear|wake word)"
+    r"|^(?:are you )?listening\??$|^(?:listen to me|take a message)$", re.I)
+
+
+def _rule_files_say(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    """``create a file called ideas.md with three names`` -> a real write.
+
+    Refuses nothing here: :mod:`files` decides confinement and answers with
+    ``needs_confirmation`` when the path is outside the granted roots.
+    """
+    name = (m.group("name") or "").strip()
+    body = (m.group("body") or m.group("body2") or "").strip()
+    name = name.strip(" .,")
+    if not name:
+        return None
+    if not re.search(r"\.(md|txt|py|csv|json|html|js|ts|log|yml|yaml|ini|bat|ps1|sh|c|h|cpp|mdx)$", name, re.I) \
+            and not re.search(r"file|document|doc|folder|directory|script", m.group(0), re.I):
+        return None            # "write a poem about rain" is the model's job, not a file job
+    if re.search(r"folder|directory", m.group(0), re.I) and not body:
+        return {"calls": [{"tool": "manage_files", "arguments": {"action": "mkdir", "path": name}}],
+                "answer_prefix": ""}
+    return {"calls": [{"tool": "manage_files", "arguments": {"action": "write", "path": name,
+                                                            "content": body}}]}
+
+
+def _rule_files_delete(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    """Delete: inside the JARVIS folder it just happens, outside it asks first.
+
+    The distinction is the safety model in one line.  Anything under ``FILES_ROOT`` is
+    recoverable by construction (private copy in ``data/file_trash`` + the Recycle Bin + the
+    undo journal), so gating it would train the user to say "confirm" at everything.  Anything
+    outside those roots is somebody else's file, and gets asked about.
+    """
+    name = (m.group("name") or "").strip()
+    if not name or " " in name and not re.search(r"[.\\/]", name):
+        return None
+    call = {"tool": "manage_files", "arguments": {"action": "delete", "path": name}}
+    inside = False
+    try:
+        import files as _files
+
+        located, _error = _files.resolve_path(name)
+        inside = bool(located is not None and located.inside)
+    except Exception as exc:  # noqa: BLE001 - if the layer cannot answer, ask the human
+        log.debug("delete rule could not check the roots: %s", exc)
+    if inside:
+        return {"calls": [call]}
+    return {"calls": [call],
+            "confirm": f"Say “confirm” and I will move {name} to the Recycle Bin - I keep a copy "
+                       "too, so “undo that” brings it back."}
+
+
+def _rule_files_read(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    name = (m.group("name") or "").strip(" .,")
+    if not name or len(name) < 2:
+        return None
+    if not re.search(r"\.\w{1,6}$", name) and not re.search(r"\bfile\b|\bdoc\b|\bdocument\b", text, re.I):
+        return None            # "read the news" / "read out top 3 results" are not file reads
+    return {"calls": [{"tool": "manage_files", "arguments": {"action": "read", "path": name}}]}
+
+
+def _rule_files_list(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    wanted = "downloads" if "downloads" in text.lower() else ("notes" if "notes" in text.lower() else "")
+    return {"calls": [{"tool": "manage_files", "arguments": {"action": "list", "path": wanted}}]}
+
+
+def _rule_files_search(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    return {"calls": [{"tool": "manage_files",
+                      "arguments": {"action": "search", "query": (m.group("name") or "").strip()}}]}
+
+
+def _rule_files_undo(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    return {"calls": [{"tool": "manage_files", "arguments": {"action": "undo", "limit": "1"}}]}
+
+
+def _rule_screen(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    low = text.lower()
+    action = "describe" if ("describe" in low or "looking at" in low or "what do you see" in low) else "read"
+    return {"calls": [{"tool": "read_screen", "arguments": {"action": action, "count": "3",
+                                                           "question": "", "target": "screen",
+                                                           "save_to": ""}}]}
+
+
+def _rule_screen_top(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    if re.search(r"\b(?:open|search|google|look up|navigate|go to)\b", text, re.I):
+        return None            # "open google and read the top 3 results" must chain, not just read
+    words = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5"}
+    raw = (m.group("n") or "3").lower()
+    return {"calls": [{"tool": "read_screen",
+                      "arguments": {"action": "list", "count": words.get(raw, raw),
+                                    "question": "", "target": "screen", "save_to": ""}}]}
+
+
+def _rule_type(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    spoken = (m.groupdict().get("textq") or m.groupdict().get("text") or "").strip()
+    if not spoken or len(spoken.split()) < 1 or len(spoken) < 2:
+        return None            # "type it" is not a dictation - leave that to the model
+    return {"calls": [{"tool": "control_desktop",
+                      "arguments": {"action": "type", "text": spoken[:400]}}]}
+
+
+def _rule_press(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    key = (m.group("key") or "").replace(" arrow", "").strip()
+    times = m.group(2) or "1"
+    return {"calls": [{"tool": "control_desktop",
+                      "arguments": {"action": "press", "keys": key, "amount": times}}]}
+
+
+def _rule_window_state(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    action = (m.group("action") or "minimize").lower()
+    action = {"minimise": "minimize", "maximise": "maximize", "hide": "minimize"}.get(action, action)
+    return {"calls": [{"tool": "control_desktop", "arguments": {"action": action}}]}
+
+
+def _rule_focus_app(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    app = (m.group("app") or "").strip()
+    if not app or tools.is_known_site(app):
+        return None            # "switch to google.com" is a browser thing, not a window thing
+    return {"calls": [{"tool": "focus_app", "arguments": {"name": app}}]}
+
+
+def _rule_apps_ask(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    return {"calls": [{"tool": "list_apps", "arguments": {"query": ""}}]}
+
+
+def _rule_remind(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    what = (m.group("what") or "").strip(" .,!?")
+    when = (m.group("when") or "").strip()
+    if not when:
+        return None
+    run = "yes" if re.match(r"^(?:check|run|see if|look at|open|test)\b", what, re.I) else ""
+    return {"calls": [{"tool": "set_reminder", "arguments": {"action": "add", "text": what,
+                                                            "when": when, "run": run, "minutes": ""}}]}
+
+
+def _rule_remind_timer(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    return {"calls": [{"tool": "set_reminder", "arguments": {"action": "add", "text": "Timer finished",
+                                                            "when": "in " + (m.group("when") or "").strip(),
+                                                            "minutes": "", "run": ""}}]}
+
+
+def _rule_remind_list(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    return {"calls": [{"tool": "set_reminder", "arguments": {"action": "list", "text": "",
+                                                            "when": "", "minutes": "", "run": ""}}]}
+
+
+def _rule_remind_cancel(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    return {"calls": [{"tool": "set_reminder", "arguments": {"action": "cancel",
+                                                            "text": (m.group("what") or "").strip(),
+                                                            "when": "", "minutes": "", "run": ""}}]}
+
+
+def _rule_listening(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    low = text.lower()
+    if re.search(r"\b(stop|disable)\b", low):
+        action = "stop"
+    elif re.search(r"\b(start|enable)\b", low):
+        action = "start"
+    elif re.search(r"listen to me|take a message", low):
+        action = "listen"
+    else:
+        action = "status"
+    return {"calls": [{"tool": "listening", "arguments": {"status": action}}]}
+
+
 INSTANT_RULES: List[Rule] = [
+    # ---- hands: files, eyes, desktop, time, ears --------------------------
+    ("files-undo", _FILE_UNDO_RE, _rule_files_undo),
+    ("files-delete", _FILE_DELETE_RE, _rule_files_delete),
+    ("files-say", _FILE_SAY_RE, _rule_files_say),
+    ("files-search", _FILE_SEARCH_RE, _rule_files_search),
+    ("files-list", _FILE_LIST_RE, _rule_files_list),
+    ("files-read", _FILE_READ_RE, _rule_files_read),
+    ("screen-top", _SCREEN_TOP_RE, _rule_screen_top),
+    ("screen-read", _SCREEN_READ_RE, _rule_screen),
+    ("desktop-type", _DESKTOP_TYPE_RE, _rule_type),
+    ("desktop-press", _DESKTOP_KEY_RE, _rule_press),
+    ("desktop-window", _DESKTOP_WIN_RE, _rule_window_state),
+    ("remind-timer", _REMIND_TIMER_RE, _rule_remind_timer),
+    ("remind-add", _REMIND_ADD_RE, _rule_remind),
+    ("remind-cancel", _REMIND_CANCEL_RE, _rule_remind_cancel),
+    ("remind-list", _REMIND_LIST_RE, _rule_remind_list),
+    ("apps-ask", _APPS_ASK_RE, _rule_apps_ask),
+    ("focus-app", _FOCUS_APP_RE, _rule_focus_app),
+    ("listening", _LISTENING_RE, _rule_listening),
     ("greeting", _GREETING_RE, _rule_greeting),
     ("clear", _CLEAR_RE, lambda m, t: {"answer": "Context cleared.", "direct": True, "speak": True, "clear_history": True}),
     ("stop", _STOP_RE, lambda m, t: {"answer": "Stopped.", "direct": True, "speak": False, "stop_tts": True}),
@@ -862,6 +1125,7 @@ async def _finish(
 
     if speak and not _STATE["muted"] and answer:
         set_mode("speaking", answer[:70])
+        _duck_ear(answer)
         try:
             out = TTS_DIR / f"say-{int(time.time() * 1000)}.wav"
             result = await asyncio.to_thread(voice.tts.synth, answer, out)
@@ -973,11 +1237,87 @@ async def _learn_models() -> None:
                                   f"`python llm_providers.py` and pin <PROVIDER>_MODEL_FAST in .env")
 
 
+def _duck_ear(answer: str) -> None:
+    """Deafen the background ear for about as long as this reply takes to speak.
+
+    Without it JARVIS hears its own voice, transcribes its own sentence and answers itself -
+    the classic speakerphone loop.  The estimate is deliberately generous: half a re-heard
+    sentence is an endless conversation, one extra second of silence is nothing.
+    """
+    seconds = max(2.0, min(45.0, len(str(answer or "")) / 3.6 + 2.5))
+    try:
+        import wake as _wake
+
+        _wake.LISTENER.duck(seconds)
+    except Exception as exc:  # noqa: BLE001 - no ear means nothing to duck
+        log.debug("ear duck skipped: %s", exc)
+
+
+def queue_spoken_command(text: str, source: str = "scheduled") -> Dict[str, Any]:
+    """Run a command through the normal funnel from a non-async thread.
+
+    The reminder scheduler lives outside the event loop, so it hands work back with
+    ``run_coroutine_threadsafe`` and does not wait: a timer that blocks on the LLM would
+    drift, and a fired reminder must be recorded even if the answer takes a moment.
+    """
+    loop = _STATE.get("loop")
+    text = " ".join((text or "").split())
+    if not text:
+        return {"ok": False, "error": "nothing to run"}
+    if loop is None or not loop.is_running():
+        # No server loop (tests, or the launcher running headless): do it synchronously.
+        try:
+            return asyncio.run(handle_command(text, source=source))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+    asyncio.run_coroutine_threadsafe(handle_command(text, source=source), loop)
+    return {"ok": True, "queued": True, "text": text}
+
+
+def _on_wake_command(event: Any) -> None:
+    """A background wake-word utterance becomes a normal command turn."""
+    text = str(getattr(event, "text", "") or "").strip()
+    if not text:
+        return
+    via = str(getattr(event, "via", "wake-word") or "wake-word")
+    TERMINAL.push("in", f"[{via}] {text}")
+    try:
+        import wake as _wake
+
+        _wake.LISTENER.duck(SETTINGS.llm_budget_seconds + 12)   # stay deaf while JARVIS talks
+        if _wake.LISTENER.on_speaking:
+            _wake.LISTENER.on_speaking(True)
+    except Exception:  # noqa: BLE001
+        pass
+    queue_spoken_command(text, source=via)
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         HUB.attach_loop(asyncio.get_running_loop())
+        _STATE["loop"] = asyncio.get_running_loop()
         tasks = [asyncio.create_task(_telemetry_loop(), name="jarvis-telemetry")]
+        # Scheduled actions fire on their own thread; a due reminder is spoken AND run through
+        # the normal command funnel, so "at 7 check my download" really checks the download.
+        try:
+            import reminders as _reminders
+
+            _reminders.BOARD.fire = _reminders.fire_and_speak
+            started = _reminders.BOARD.start()
+            _STATE["reminders"] = started
+            if started.get("ok"):
+                TERMINAL.push("sys", "scheduler online · " + started.get("message", ""))
+        except Exception as exc:  # noqa: BLE001 - a broken schedule must not stop the assistant
+            _STATE["reminders"] = {"ok": False, "message": str(exc)}
+            log.warning("reminder scheduler not started: %s", exc)
+        try:
+            import wake as _wake
+
+            _wake.LISTENER.on_command = _on_wake_command
+            _wake.LISTENER.on_state = lambda data: HUB.emit({"type": "wake", **data})
+        except Exception as exc:  # noqa: BLE001
+            log.debug("wake listener not wired: %s", exc)
         bridge = None
         if SETTINGS.discord_enabled and SETTINGS.discord_token:
             try:
@@ -1364,7 +1704,117 @@ def create_app() -> FastAPI:
         await ws.send_json({"type": "segment", "text": transcript.text, "confidence": transcript.confidence})
         await handle_command(transcript.text, source="mic-stream", speak=SETTINGS.speak_replies)
 
+    @app.get("/bar")
+    async def get_bar() -> FileResponse:
+        """The floating prompt bar, served so it works in a browser and in pywebview."""
+        candidate = config.ROOT / "static" / "bar.html"
+        if not candidate.is_file():
+            raise HTTPException(status_code=404, detail="bar.html missing")
+        return FileResponse(str(candidate), media_type="text/html")
+
+    @app.get("/api/desktop")
+    async def get_desktop() -> Dict[str, Any]:
+        """One panel's worth of "what can you actually do on this machine right now"."""
+        import apps as _apps
+        import files as _files
+        import screen as _screen
+        import winops as _winops
+
+        ocr_probe = await asyncio.to_thread(_screen.ocr)
+        return {
+            "ok": True,
+            "windows": bool(_winops.IS_WINDOWS),
+            "apps": {"known": len(_apps.known_names()), "ttl_seconds": SETTINGS.app_index_ttl,
+                     "start_menu": len(_apps.start_menu_index()), "uwp": len(_apps.uwp_index())},
+            "files": {"roots": [str(p) for p in _files.roots()],
+                      "journal": len(_files.journal(20)), "delete_policy": SETTINGS.file_delete_policy},
+            "screen": {"ocr_ready": bool(ocr_probe.get("ok")), "detail": str(ocr_probe.get("message", ""))[:160],
+                       "vision": SETTINGS.screen_vision_enabled},
+            "reminders": {"count": len(_reminders_list()), "enabled": SETTINGS.reminders_enabled},
+            "listening": _wake_status(),
+        }
+
+    @app.get("/api/reminders")
+    async def get_reminders() -> Dict[str, Any]:
+        rows = _reminders_list()
+        return {"ok": True, "count": len(rows), "reminders": rows}
+
+    @app.post("/api/reminders")
+    async def post_reminders(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
+        import reminders as _reminders
+
+        action = str(payload.get("action") or "add").lower()
+        if action == "cancel":
+            return _reminders.BOARD.cancel(str(payload.get("text") or ""))
+        if action == "snooze":
+            return _reminders.BOARD.snooze(str(payload.get("text") or ""), int(payload.get("minutes") or 10))
+        if action == "list":
+            return {"ok": True, "reminders": _reminders_list()}
+        return _reminders.BOARD.add(str(payload.get("text") or ""), str(payload.get("when") or ""),
+                                    bool(payload.get("run")))
+
+    @app.post("/api/listening")
+    async def post_listening(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
+        import wake as _wake
+
+        action = str(payload.get("action") or "start").lower()
+        if action in {"stop", "off"}:
+            return _wake.LISTENER.stop()
+        if action in {"listen", "talk"}:
+            return await asyncio.to_thread(_wake.LISTENER.record_once, float(payload.get("seconds", 5)))
+        if action == "status":
+            return {"ok": True, "status": _wake.LISTENER.status()}
+        out = _wake.LISTENER.start()
+        HUB.emit({"type": "wake", **_wake.LISTENER.status()})
+        return out
+
+    @app.post("/api/bar")
+    async def post_bar(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
+        controller = getattr(config, "BAR_CONTROLLER", None)
+        action = str(payload.get("action") or "show").lower()
+        if controller is None:
+            return {"ok": False, "message": "No overlay window here - open the HUD instead."}
+        try:
+            return {"ok": True, "action": action, **dict(controller(action))}
+        except Exception as exc:  # noqa: BLE001 - a stuck overlay is never worth a 500
+            return {"ok": False, "message": f"Overlay failed: {exc}"}
+
+    @app.get("/api/screen")
+    async def get_screen(action: str = "capture", count: int = 3, question: str = "") -> Dict[str, Any]:
+        import screen as _screen
+
+        action = (action or "capture").lower()
+        if action == "capture":
+            return await asyncio.to_thread(_screen.capture)
+        if action in {"read", "ocr"}:
+            return await asyncio.to_thread(_screen.ocr)
+        if action in {"list", "top"}:
+            return await asyncio.to_thread(_screen.read_screen, count)
+        if action == "window":
+            return await asyncio.to_thread(_screen.window_text)
+        return await asyncio.to_thread(_screen.describe, question)
+
     return app
+
+
+def _reminders_list() -> List[Dict[str, Any]]:
+    """The schedule as plain rows, for the HUD and the /api panel (never raises)."""
+    try:
+        import reminders as _reminders
+
+        return _reminders.BOARD.list()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("reminders unavailable: %s", exc)
+        return []
+
+
+def _wake_status() -> Dict[str, Any]:
+    try:
+        import wake as _wake
+
+        return _wake.LISTENER.status()
+    except Exception as exc:  # noqa: BLE001
+        return {"running": False, "detail": str(exc)}
 
 
 def _trim(text: str, limit: int = 160) -> str:
@@ -1391,7 +1841,8 @@ def serve(host: Optional[str] = None, port: Optional[int] = None, log_level: str
 app = create_app()
 
 
-__all__ = ["app", "create_app", "handle_command", "match_instant", "HUB", "TERMINAL", "INSTANT_RULES", "serve"]
+__all__ = ["app", "create_app", "handle_command", "match_instant", "queue_spoken_command", "HUB", "TERMINAL",
+           "INSTANT_RULES", "serve"]
 
 
 if __name__ == "__main__":

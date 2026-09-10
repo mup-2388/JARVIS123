@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<!--
+  JARVIS · floating prompt bar.
+
+  Why this file exists: the user asked for "a little prompt entering bar [that] comes up when I am
+  on a different app".  The HUD is a real window and takes focus; this is not.  main.py creates it as
+  a frameless, top-most, WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW overlay, so a game, an IDE or a video keeps
+  the caret while the bar still accepts typed text, push-to-talk and the wake word.
+
+  It is dependency-free on purpose - no CDN, no fonts, no build step.  It must render instantly on a
+  laptop that may have no internet, and it must be openable directly from disk (file://) as well as
+  from http://127.0.0.1:<port>/bar.
+-->
+<html lang="en" data-bar>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS bar</title>
+<style>
+  :root {
+    --ink: #dff6ff;
+    --dim: #7fa8bd;
+    --cyan: #35e6ff;
+    --amber: #ffcf6a;
+    --red: #ff6b7d;
+    --line: rgba(53, 230, 255, .22);
+    --glass: rgba(6, 12, 20, .82);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+  body {
+    font: 500 13px/1.35 ui-monospace, "Cascadia Mono", Consolas, "Segoe UI Mono", monospace;
+    color: var(--ink);
+    -webkit-user-select: none; user-select: none;
+  }
+  #shell {
+    height: 100%; display: flex; flex-direction: column; gap: 4px;
+    padding: 7px 9px 8px; border: 1px solid var(--line); border-radius: 14px;
+    background: var(--glass); backdrop-filter: blur(14px) saturate(140%);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), 0 12px 34px rgba(0, 0, 0, .55),
+                inset 0 0 26px rgba(53, 230, 255, .07);
+  }
+  /* pywebview's easy_drag makes the shell draggable, except over controls */
+  #shell { -webkit-app-region: drag; }
+  button, input, .chip { -webkit-app-region: no-drag; }
+
+  .row { display: flex; align-items: center; gap: 7px; }
+  #head { font-size: 10.5px; letter-spacing: .13em; text-transform: uppercase; color: var(--dim); }
+  #mark { display: flex; align-items: center; gap: 6px; color: var(--cyan); font-weight: 700; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cyan);
+         box-shadow: 0 0 10px var(--cyan); transition: background .18s, box-shadow .18s; }
+  body[data-mode="thinking"] #dot { background: var(--amber); box-shadow: 0 0 12px var(--amber); }
+  body[data-mode="speaking"] #dot { background: #7cffb0; box-shadow: 0 0 12px #7cffb0; }
+  body[data-mode="error"] #dot { background: var(--red); box-shadow: 0 0 12px var(--red); }
+  #mode { color: var(--ink); }
+  #ear { margin-left: auto; display: flex; align-items: center; gap: 5px; cursor: pointer;
+         border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; background: rgba(53,230,255,.05); }
+  #ear[aria-pressed="true"] { color: var(--cyan); border-color: rgba(53,230,255,.55); }
+  #hide { border: 0; background: transparent; color: var(--dim); cursor: pointer; font-size: 15px;
+          line-height: 1; padding: 0 2px; }
+  #hide:hover { color: var(--red); }
+
+  #live { flex: 1; height: 3px; border-radius: 3px; background: rgba(255,255,255,.07); overflow: hidden; }
+  #live i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #14768e, var(--cyan));
+            transition: width .09s linear; }
+
+  #entry { flex: 1; min-width: 0; height: 32px; border-radius: 9px; padding: 0 11px;
+           border: 1px solid var(--line); background: rgba(255,255,255,.045); color: var(--ink);
+           font: inherit; outline: none; }
+  #entry::placeholder { color: rgba(127,168,189,.65); }
+  #entry:focus { border-color: rgba(53,230,255,.6); box-shadow: 0 0 0 3px rgba(53,230,255,.1); }
+  .btn { height: 32px; padding: 0 11px; border-radius: 9px; cursor: pointer; color: #04131a;
+         border: 1px solid rgba(53,230,255,.5); background: linear-gradient(180deg, #6ff0ff, #19b6d6);
+         font: 700 12px/1 ui-monospace, Consolas, monospace; }
+  .btn.ghost { background: rgba(255,255,255,.05); color: var(--ink); border-color: var(--line); }
+  .btn:active { transform: translateY(1px); }
+  .btn[data-busy="1"] { opacity: .55; pointer-events: none; }
+  #mic[data-rec="1"] { background: linear-gradient(180deg, #ffb3c0, #ff5f7a); color: #240007;
+                       border-color: rgba(255,107,125,.6); }
+
+  #chips { gap: 5px; }
+  .chip { font-size: 10.5px; padding: 3px 8px; border-radius: 999px; cursor: pointer; color: var(--dim);
+          border: 1px solid var(--line); background: rgba(53,230,255,.04); }
+  .chip:hover { color: var(--cyan); border-color: rgba(53,230,255,.5); }
+
+  #reply { font-size: 11.5px; color: var(--dim); max-height: 3.6em; overflow: hidden; line-height: 1.4; }
+  #reply b { color: var(--ink); font-weight: 600; }
+  #reply[data-kind="fail"] { color: #ffb9c4; }
+  #reply[data-kind="fail"] b { color: #ffd7de; }
+  #hint { font-size: 9.5px; color: rgba(127,168,189,.7); letter-spacing: .04em; }
+  #hint kbd { color: var(--ink); border: 1px solid var(--line); border-radius: 4px; padding: 0 3px; }
+  body[data-offline="1"] #shell { border-color: rgba(255,207,106,.5); }
+</style>
+</head>
+<body data-mode="idle">
+  <div id="shell">
+    <div class="row" id="head">
+      <span id="mark"><i id="dot"></i>jarvis</span>
+      <span id="mode">idle</span>
+      <span id="live"><i></i></span>
+      <button id="ear" type="button" aria-pressed="false" title="Toggle the always-on wake-word ear">ear off</button>
+      <button id="hide" type="button" title="Hide the bar (Esc)">×</button>
+    </div>
+
+    <div class="row">
+      <input id="entry" autocomplete="off" spellcheck="false"
+             placeholder="type a command — try: read my screen · open bluetooth settings · create a file called ideas.md">
+      <button class="btn" id="go" type="button">SEND</button>
+      <button class="btn ghost" id="mic" type="button" title="Push to talk — hold or click, click again to stop">LISTEN</button>
+    </div>
+
+    <div class="row" id="chips">
+      <button class="chip" data-say="what am I looking at">read screen</button>
+      <button class="chip" data-say="read out top 3 results">top 3</button>
+      <button class="chip" data-say="list my reminders">schedule</button>
+      <button class="chip" data-say="what can you open on this pc">apps</button>
+      <button class="chip" data-say="list my files">files</button>
+      <button class="chip" data-say="start listening">wake ear</button>
+    </div>
+
+    <div class="row" style="justify-content:space-between">
+      <div id="reply">Idle. <b>Tell me what to do on this machine.</b></div>
+    </div>
+    <div id="hint">Enter send · <kbd>Esc</kbd> hide · <kbd>↑</kbd> history · wake word starts a reply from any app</div>
+  </div>
+  <script src="bar.js"></script>
+</body>
+</html>

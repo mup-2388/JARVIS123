@@ -139,6 +139,32 @@ def preflight() -> Dict[str, Any]:
         log.warning("voice clone sample missing at %s -- falling back to the OS voice",
                     SETTINGS.reference_wav_path)
     report["notes"] = len(list(SETTINGS.notes_path.glob("*.md"))) if SETTINGS.notes_path.is_dir() else 0
+    # The hands: what the desktop layer can actually do on this machine right now.
+    try:
+        import apps as _apps
+        import files as _files
+        import winops as _winops
+        import screen as _screen
+
+        report["apps_known"] = len(_apps.known_names())
+        report["files_roots"] = [str(p) for p in _files.roots()]
+        report["windows_session"] = bool(_winops.IS_WINDOWS)
+        report["ocr_ready"] = bool(_screen.ocr().get("ok"))
+        try:
+            import wake as _wake
+
+            report["ear"] = _wake.LISTENER.available()[1] or "ready"
+        except Exception as exc:  # noqa: BLE001
+            report["ear"] = str(exc)
+        try:
+            import reminders as _reminders
+
+            report["reminders"] = len(_reminders.BOARD.list())
+        except Exception as exc:  # noqa: BLE001
+            report["reminders"] = 0
+            log.debug("schedule not readable at boot: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        report["desktop"] = f"desktop layer unavailable: {exc}"
     return report
 
 
@@ -368,6 +394,32 @@ def llm_row(report: Dict[str, Any]) -> str:
     return detail
 
 
+def _roots_row(report: Dict[str, Any]) -> str:
+    """Where the file powers are allowed to write - printed at boot, because it must not be a surprise."""
+    roots = report.get("files_roots") or []
+    if not roots:
+        return "file tools have no writable root yet (set FILES_ROOT in .env)"
+    policy = (SETTINGS.file_delete_policy or "recycle").lower()
+    extra = " (+1 more)" if len(roots) > 1 else ""
+    return f"writes confined to {roots[0]}{extra} · deletes to the {policy} · undo journalled"
+
+
+def _screen_row(report: Dict[str, Any]) -> str:
+    ocr = "Windows OCR ready" if report.get("ocr_ready") else "no local OCR engine (pip install winsdk)"
+    vision = "vision AI on" if SETTINGS.screen_vision_enabled else "vision AI off"
+    return f"{ocr} · {vision}"
+
+
+def _ear_row(report: Dict[str, Any]) -> str:
+    ear = " ".join(str(report.get("ear", "?")).split())
+    # Keep one line per capability: the reason is useful, a paragraph is not.
+    if len(ear) > 96:
+        ear = ear[:95].rstrip(" -,.;") + "…"
+    bar = "bar on (F12)" if SETTINGS.bar_enabled else "bar off"
+    words = "/".join((SETTINGS.wake_words or "jarvis").split(","))[:48]
+    return f"{ear} · wake on \"{words}\" · {bar}"
+
+
 def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
     rows = [
         ("core", f"http://127.0.0.1:{port}  (HUD at /, WS at /ws)"),
@@ -378,6 +430,14 @@ def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
         ("ffmpeg", "present" if report.get("ffmpeg") else "MISSING (mic upload disabled)"),
         ("notes", f"{report.get('notes', 0)} file(s) in {SETTINGS.notes_path}"),
         ("LLM", llm_row(report)),
+        # The hands: one line per capability, so a machine that is missing a driver says so
+        # before the first command, instead of JARVIS sounding confident and doing nothing.
+        ("apps", f"{report.get('apps_known', 0)} resolvable" if "desktop" not in report
+                 else str(report.get("desktop"))),
+        ("files", _roots_row(report)),
+        ("screen", _screen_row(report)),
+        ("ear", _ear_row(report)),
+        ("schedule", f"{report.get('reminders', 0)} pending action(s)"),
         ("discord", "token set" if SETTINGS.discord_token else "not configured"),
         ("api-sports", "key set" if SETTINGS.api_sports_key else "no key -> sports tool reports why"),
         ("mode", mode),
@@ -387,6 +447,19 @@ def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
     for key, value in rows:
         print(f"   {key:<{width}}  {value}")
     print()
+
+
+def _bar_top() -> int:
+    """Y-position for the floating bar: bottom-left of the primary screen, above the taskbar."""
+    try:
+        import winops
+
+        size = winops.screen_size()
+        if len(size) > 1 and size[1]:
+            return max(0, int(size[1]) - SETTINGS.bar_height - 96)
+    except Exception:  # noqa: BLE001 - no display info is no reason to fail
+        pass
+    return 640
 
 
 def attach_loaded_handler(window: object, handler) -> str:  # noqa: ANN001
@@ -496,6 +569,85 @@ def launch(args: argparse.Namespace) -> int:
     #: private on purpose: pywebview exposes every public attribute it can walk,
     #: so the native window must never be reachable from the JS surface.
     bridge._window = window
+
+    # ---- the floating bar: a frameless, top-most, no-focus strip --------------
+    # It exists so the user can talk or type to JARVIS while a game, IDE or video keeps the
+    # foreground.  `hidden=True` matters: showing it on start would steal the caret.
+    bar = None
+    if SETTINGS.bar_enabled:
+        bar_url = f"http://127.0.0.1:{port}/bar"
+        try:
+            bar = webview.create_window(
+                "JARVIS bar", bar_url, width=max(360, SETTINGS.bar_width), height=max(64, SETTINGS.bar_height),
+                x=48, y=_bar_top(), easy_drag=True,
+                frameless=True, on_top=True, resizable=False, hidden=True, background_color="#05080e",
+            )
+        except TypeError:
+            # Older pywebview releases reject easy_drag/hidden; retry with what they know.
+            try:
+                bar = webview.create_window("JARVIS bar", bar_url, width=max(360, SETTINGS.bar_width),
+                                            height=max(64, SETTINGS.bar_height), frameless=True, on_top=True,
+                                            background_color="#05080e")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("overlay bar could not be created: %s", exc)
+                bar = None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("overlay bar could not be created: %s", exc)
+            bar = None
+
+    def bar_controller(action: str = "show") -> Dict[str, Any]:
+        """show/hide/toggle the bar, and make it behave like an overlay, not a window."""
+        if bar is None:
+            return {"ok": False, "visible": False, "message": "overlay unavailable"}
+        action = (action or "show").lower()
+        visible = bool(getattr(bar_controller, "visible", False))
+        try:
+            if action == "hide":
+                bar.hide()
+                bar_controller.visible = False
+            elif action == "toggle":
+                (bar.hide() if visible else bar.show())
+                bar_controller.visible = not visible
+            else:
+                bar.show()
+                bar_controller.visible = True
+                _style_overlay(bar)
+        except Exception as exc:  # noqa: BLE001 - a stuck overlay must not kill the app
+            return {"ok": False, "visible": visible, "message": str(exc)}
+        return {"ok": True, "visible": bool(bar_controller.visible)}
+
+    def _style_overlay(handle_owner: Any) -> None:
+        """Apply WS_EX_TOOLWINDOW | NOACTIVATE so the bar never steals focus or alt-tabs."""
+        try:
+            import winops
+
+            hwnd = None
+            native = getattr(handle_owner, "native", None)
+            for attr in ("Handle", "handle"):
+                value = getattr(native, attr, None)
+                if value:
+                    hwnd = int(value)
+                    break
+            if hwnd:
+                winops.tool_window(hwnd, on_top=True, no_activate=True)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("overlay styling skipped: %s", exc)
+
+    bar_controller.visible = False
+    config.BAR_CONTROLLER = bar_controller
+
+
+    def start_background_ear() -> None:
+        """Switch the always-on listener on, once the server is answering commands."""
+        try:
+            import wake
+
+            outcome = wake.LISTENER.start()
+            log.info("background ear: %s", outcome.get("message", ""))
+        except Exception as exc:  # noqa: BLE001 - optional, never fatal
+            log.warning("background listening unavailable: %s", exc)
+
+    threading.Timer(2.0, start_background_ear).start()
 
     def on_loaded() -> None:  # noqa: ANN001 - pywebview passes no args
         """Tell the file://-loaded HUD where its WebSocket lives, then decorate it."""
