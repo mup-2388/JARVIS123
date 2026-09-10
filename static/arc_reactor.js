@@ -524,7 +524,7 @@ function handlePayload(payload) {
     case 'hello': {
       const cfg = payload.config || {};
       log('sys', `JARVIS core v${payload.version || '?'} · ${payload.server_time || ''}`.trim());
-      log('sys', `track1 rules: ${(cfg.instant_rules || []).length} · tools: ${(cfg.tools || cfg.apps || []).length} · model: ${cfg.brain?.model || 'n/a'}`);
+      log('sys', `track1 rules: ${(cfg.instant_rules || []).length} · tools: ${(cfg.tools || []).length || (cfg.brain?.tools_bound ?? '—')} · providers: ${(cfg.brain?.available || cfg.brain?.configured || ['none']).join('/')}`);
       if (Array.isArray(cfg.log) && cfg.log.length) {
         log('sys', '— replaying recent core log —');
         cfg.log.slice(-24).forEach(logEntry);
@@ -554,6 +554,15 @@ function handlePayload(payload) {
       if (track) track.textContent = payload.track || '—';
       const latency = $('pill-latency');
       if (latency) latency.textContent = `${payload.latency_ms ?? 0} ms`;
+      const brainPill = $('pill-model');
+      if (brainPill) {
+        const model = String(payload.model || '');
+        brainPill.textContent = model || '—';
+        brainPill.classList.toggle('pill-model-local', /^(local-regex|heuristic)/.test(model));
+        brainPill.title = model
+          ? `answered by ${model}${String(payload.track || '') === 'agent' ? ' (Track 2, agentic)' : ' (Track 1, no AI call)'}`
+          : 'no brain reported a model for that reply';
+      }
       state.latency = num(payload.latency_ms);
       const instant = $('hit-instant');
       const agent = $('hit-agent');
@@ -566,6 +575,8 @@ function handlePayload(payload) {
         const mark = call.ok === false ? 'err' : 'tool';
         log(mark, `⚙ ${call.tool}(${Object.entries(call.arguments || {}).map(([k, v]) => `${k}=${typeof v === 'string' ? JSON.stringify(v) : v}`).join(', ')}) → ${String(call.message || (call.ok === false ? 'failed' : 'done')).slice(0, 160)}`);
       });
+      if (payload.model) log('sys', `brain: ${payload.model}${payload.tier ? ` · ${payload.tier} tier` : ''}`);
+      if (String(payload.track || '') === 'agent') refreshProviders();
       if (payload.error) log('err', String(payload.error).slice(0, 200));
       if (payload.card) renderCard(payload.card);
       if (payload.answer) setMode(payload.speak ? 'speaking' : 'idle');
@@ -632,10 +643,111 @@ function applyVoiceState(voice, brain) {
       stt.classList.add('text-amber-200');
     }
   }
+  renderProviders(brain);
   const llm = $('llm-state');
   if (llm && brain) {
-    llm.textContent = `llm ${brain.token_set ? 'armed' : 'no token'} · ${brain.model || '—'}`;
-    llm.title = brain.last_error || `avg ${brain.avg_ms}ms over ${brain.calls} calls · ${brain.tools_bound} tools bound`;
+    const live = brain.available || [];
+    const cooling = (brain.providers || []).filter((p) => p.cooling);
+    const active = brain.active || live[0] || '';
+    const model = ((brain.providers || []).find((p) => p.key === active) || {}).model || '';
+    llm.textContent = live.length
+      ? `llm ${active || 'auto'} · ${model}${cooling.length ? ` · ${cooling.length} cooling` : ''}`
+      : (brain.configured && brain.configured.length ? 'llm all providers cooling' : 'llm no provider key in .env');
+    llm.classList.toggle('text-amber-200', !live.length);
+    llm.title = [
+      `configured: ${(brain.configured || []).join(', ') || 'none'}`,
+      cooling.length ? `cooling: ${cooling.map((p) => `${p.key} ${Math.max(1, Math.round((p.cool_left_s || 0) / 60))}m`).join(', ')}` : '',
+      `avg ${brain.avg_ms || 0}ms over ${brain.calls || 0} calls (${brain.fast_calls || 0} fast / ${brain.smart_calls || 0} smart)`,
+      brain.last_error || '',
+      live.length ? '' : 'add GROQ_API_KEY (or CEREBRAS/CLOUDFLARE/GEMINI) to .env, then restart',
+    ].filter(Boolean).join('\n');
+  }
+}
+
+/* ---- AI provider ring -----------------------------------------------------
+   Fed by the same `brain` object the core pushes on hello/status, plus a 15 s
+   poll of /api/llm so a cooldown you just hit shows up without a restart. */
+function humanise(seconds) {
+  const left = Math.max(0, Number(seconds) || 0);
+  if (left < 90) return `${Math.round(left)}s`;
+  if (left < 5400) return `${Math.round(left / 60)}m`;
+  if (left < 172800) return `${(left / 3600).toFixed(1)}h`;
+  return `${Math.round(left / 86400)}d`;
+}
+
+function providerRow(p, brain) {
+  const li = document.createElement('li');
+  const ready = !!p.key_set && !p.cooling && (!p.needs_account || p.account_set);
+  li.className = 'flex items-baseline justify-between gap-2 '
+    + (p.cooling ? 'text-amber-200' : ready ? 'text-cyan-100/85' : 'text-cyan-100/35');
+  const name = document.createElement('span');
+  name.className = 'min-w-0 truncate';
+  name.textContent = `${p.key === brain.active ? '▶' : p.cooling ? '▲' : p.key_set ? '●' : '○'} ${p.label}`;
+  const right = document.createElement('span');
+  right.className = 'shrink-0 tabular-nums';
+  if (p.cooling) right.textContent = `out ${humanise(p.cool_left_s)}`;
+  else if (!p.key_set) right.textContent = 'no key';
+  else if (p.needs_account && !p.account_set) right.textContent = 'no acct id';
+  else right.textContent = `${p.ok || 0} ok · ${p.avg_ms || 0}ms`;
+  const model = (brain.tier === 'smart' && p.model) || p.fast_model_used || p.model || '';
+  li.title = [
+    `${p.key} · ${model || 'no model'}`,
+    p.quota ? `free tier: ${p.quota}` : '',
+    p.reason ? `last problem: ${p.reason}` : '',
+    `reset window: ${p.reset || '—'}`,
+    p.key_set ? '' : `set ${p.key_env} in .env  (${p.key_url || 'get a key'})`,
+    p.needs_account && !p.account_set ? `also set ${p.account_env}` : '',
+  ].filter(Boolean).join('\n');
+  li.append(name, right);
+  return li;
+}
+
+function renderProviders(brain) {
+  if (!brain) return;
+  const list = $('llm-providers');
+  if (list) {
+    const providers = brain.providers || [];
+    list.replaceChildren(...providers.map((p) => providerRow(p, brain)));
+  }
+  const tier = $('llm-tier');
+  if (tier) {
+    const used = brain.tier_used ? ` · ${brain.tier_used}` : '';
+    tier.textContent = `${brain.tier || 'auto'}${used}`;
+    tier.classList.toggle('text-amber-200', brain.tier_used === 'smart');
+    tier.title = `LLM_TIER_MODE=${brain.tier || 'auto'} — cheap model for chat and tool calls, big model for reasoning-heavy asks. ${brain.fast_calls || 0} fast / ${brain.smart_calls || 0} smart so far.`;
+  }
+  const summary = $('llm-summary');
+  if (summary) {
+    const live = (brain.available || []).length;
+    const cooling = (brain.providers || []).filter((p) => p.cooling);
+    const bits = [`${live}/${(brain.configured || []).length || 0} usable`,
+                  `${brain.calls || 0} calls · avg ${brain.avg_ms || 0}ms`];
+    if (brain.failures) bits.push(`${brain.failures} failed`);
+    if (cooling.length) bits.push(`${cooling.length} cooling until reset`);
+    if (brain.offline_rest_s) bits.push(`no egress, resting ${humanise(brain.offline_rest_s)}`);
+    summary.textContent = bits.join(' · ');
+    summary.className = 'mt-2 border-t border-cyan-500/20 pt-2 font-mono text-[9.5px] leading-snug '
+      + (live ? 'text-cyan-100/55' : 'text-amber-200/80');
+    if (!live && brain.last_error) summary.title = brain.last_error;
+  }
+}
+
+let providersBusy = false;
+let providersWarned = false;
+async function refreshProviders() {
+  if (providersBusy || document.hidden) return;
+  providersBusy = true;
+  try {
+    renderProviders(await rest('/api/llm'));
+    providersWarned = false;
+  } catch {
+    if (!providersWarned) {           // the core is offline: say it once, then stay quiet
+      providersWarned = true;
+      const summary = $('llm-summary');
+      if (summary) summary.textContent = 'core unreachable — provider list paused';
+    }
+  } finally {
+    providersBusy = false;
   }
 }
 
@@ -1236,6 +1348,35 @@ $('btn-clear')?.addEventListener('click', async () => {
   try { await rest('/api/history/clear', {}); } catch { /* core offline is fine */ }
   log('sys', 'terminal and agent context cleared');
 });
+
+$('btn-llm-reset')?.addEventListener('click', async () => {
+  try {
+    const data = await rest('/api/llm/reset', {});
+    log('sys', `providers back in rotation: ${(data.cleared || []).join(', ') || 'nothing was cooling'}`);
+    await refreshProviders();
+  } catch (error) { log('err', `llm reset failed: ${error.message}`); }
+});
+
+$('btn-llm-probe')?.addEventListener('click', async () => {
+  const button = $('btn-llm-probe');
+  if (button) { button.disabled = true; button.textContent = 'probing…'; }
+  try {
+    const data = await rest('/api/llm/probe', {});
+    // probe() answers {ok, providers: {groq: {...}, ...}} -> render one line each
+    const rows = Object.entries(data.providers || {});
+    rows.forEach(([key, r]) => log(r.ok ? 'sys' : 'warn',
+      `probe ${key}: ${r.ok ? `${r.latency_ms ?? '?'}ms on ${r.model || ''} → ${r.reply || 'ok'}` : String(r.error || 'failed').slice(0, 120)}`));
+    if (!rows.length) log('sys', 'probe: no provider keys configured yet — nothing to ping');
+    await refreshProviders();
+  } catch (error) {
+    log('err', `probe failed: ${error.message}`);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = 'probe'; }
+  }
+});
+
+setInterval(refreshProviders, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshProviders(); });
 
 document.addEventListener('keydown', (event) => {
   const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName || '');

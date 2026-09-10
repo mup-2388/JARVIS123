@@ -7,15 +7,18 @@ Stdlib ``unittest`` only, so it runs on a bare Windows box without pytest:
     python -m unittest tests.test_jarvis.TestInstantTrack -v
 
 The HTTP/REST cases use FastAPI's ``TestClient`` and skip themselves if
-``httpx`` is not installed (it is pulled in by ``huggingface-hub[inference]``,
-so a normal install always has it).
+``httpx`` is not installed (FastAPI's TestClient needs it; the provider layer
+so a normal install has it).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
 import unittest
 import wave
 from pathlib import Path
@@ -46,21 +49,24 @@ class TestConfig(unittest.TestCase):
     def test_env_file_parsing(self):
         tmp = ROOT / "data" / "_test.env"
         tmp.write_text(
-            "# comment\nexport HF_TOKEN = 'secret-token' \nNOTES_DIR=notes\n\nQUOTED=\"has = sign\"\n",
+            "# comment\nexport GROQ_API_KEY = 'gsk-secret' \nNOTES_DIR=notes\n\nQUOTED=\"has = sign\"\n",
             encoding="utf-8",
         )
         parsed = config.parse_env_file(tmp)
         tmp.unlink()
-        self.assertEqual(parsed["HF_TOKEN"], "secret-token")
+        self.assertEqual(parsed["GROQ_API_KEY"], "gsk-secret")
         self.assertEqual(parsed["NOTES_DIR"], "notes")
         self.assertEqual(parsed["QUOTED"], "has = sign")
 
     def test_redacted_never_leaks_secrets(self):
         blob = json.dumps(config.SETTINGS.redacted())
-        for secret in (config.SETTINGS.hf_token, config.SETTINGS.discord_token, config.SETTINGS.api_sports_key):
+        for secret in (config.SETTINGS.groq_api_key, config.SETTINGS.cloudflare_api_token,
+                       config.SETTINGS.discord_token, config.SETTINGS.api_sports_key):
             if secret:
                 self.assertNotIn(secret, blob, "a raw secret reached the HUD-safe view")
-        self.assertIn("hf_token_set", blob)
+        self.assertIn("llm_keys_set", blob)
+        self.assertNotIn("gsk-secret", blob)
+        self.assertNotIn("api_key", blob)
 
     def test_paths_are_absolute(self):
         self.assertTrue(config.SETTINGS.notes_path.is_absolute())
@@ -96,11 +102,17 @@ class TestInstantTrack(unittest.TestCase):
                 self.assertIsNotNone(plan, f"{text!r} produced no plan")
                 self.assertEqual(plan.get("rule"), expected)
 
+    def test_questions_are_deferred_to_the_model(self):
+        """Track 1 must not steal "what is X" for DuckDuckGo - that is the AI's job."""
+        for utterance in ("what is the capital of France", "explain the german dative case",
+                          "who is the best midfielder right now", "summarise the plot of the odyssey"):
+            self.assertIsNone(server.match_instant(utterance), f"{utterance!r} should reach the agent")
+
     def test_unknown_app_is_deferred_to_the_agent(self):
         self.assertIsNone(server.match_instant("open the next big thing"))
         self.assertIsNone(server.match_instant("explain the difference between a coroutine and a thread"))
         # ...but a factual "what is X" question is a search, which Track 1 owns.
-        self.assertEqual(server.match_instant("what is the capital of France")["rule"], "search")
+        self.assertIsNone(server.match_instant("what is the capital of France"))
 
     def test_multi_command_split(self):
         plan = server.match_instant("open steam and check my cpu")
@@ -574,6 +586,441 @@ class TestJsApiSurface(unittest.TestCase):
         bridge = self.main.JarvisBridge(8760, window=object())   # plain object: no on_top setter
         result = bridge.set_topmost(True)
         self.assertIsInstance(result["ok"], bool)                 # reported, never raised
+
+
+class TestLlmProviders(unittest.TestCase):
+    """Pool rotation, quota cooldowns and tier selection -- all offline."""
+
+    def setUp(self):
+        import llm_providers as lp
+
+        self.lp = lp
+        self._real_pool = lp.POOL
+        self.pool = lp.LlmPool(state_file=Path(self._tmp_state()))
+        # A deterministic key set: two providers configured, the rest not.
+        self._env_backup = {}
+        for name, value in (("GROQ_API_KEY", "gsk-test"), ("CEREBRAS_API_KEY", "cbs-test")):
+            self._remember(name)
+            os.environ[name] = value
+        for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "OPENROUTER_API_KEY",
+                     "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID",
+                     "GITHUB_MODELS_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN"):
+            self._remember(name)
+            os.environ.pop(name, None)
+        lp.POOL = self.pool               # keep the singleton off the real state file
+
+    def _remember(self, name: str) -> None:
+        self._env_backup.setdefault(name, os.environ.get(name))
+
+    def _tmp_state(self):
+        self._dir = tempfile.mkdtemp(prefix="jarvis-llm-")
+        return str(Path(self._dir) / "llm_state.json")
+
+    def tearDown(self):
+        for name, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.lp.POOL = self._real_pool
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    # -- helpers -----------------------------------------------------------
+    @staticmethod
+    def _ok(content="", tool_calls=None):
+        message = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return 200, {}, {"choices": [{"message": message, "finish_reason": "stop"}]}
+
+    def _stub(self, replies):
+        """Patch the HTTP seam; ``replies`` maps provider key -> (status, headers, body)."""
+        calls = []
+
+        def fake_post(url, headers, payload, timeout):
+            calls.append({"url": url, "auth": headers.get("authorization", ""), "payload": payload})
+            for key, spec in self.lp.PROVIDERS.items():
+                if spec.root and spec.root in url:
+                    reply = replies.get(key, self._ok("fallback text"))
+                    return reply if isinstance(reply, tuple) and len(reply) == 3 else (200, {}, reply)
+            return self._ok("other")
+
+        self.lp._post_json = fake_post            # the single network seam
+        return calls
+
+    # -- tiering -----------------------------------------------------------
+    def test_tier_choice_favours_the_cheap_model(self):
+        self.assertEqual(self.lp.choose_tier("open steam"), "fast")
+        self.assertEqual(self.lp.choose_tier("what is the time"), "fast")
+        self.assertEqual(self.lp.choose_tier(
+            "compare the dative and accusative cases, then write me a study plan for the exam"), "smart")
+        self.assertEqual(self.lp.choose_tier("hello"), "fast")
+
+    def test_research_heuristic_rejects_chatter(self):
+        self.assertFalse(self.lp.looks_like_research("hello there"))
+        self.assertFalse(self.lp.looks_like_research("explain recursion"))
+        self.assertTrue(self.lp.looks_like_research("what is the latest transfer news"))
+        self.assertTrue(self.lp.looks_like_research("who won the match today"))
+
+    # -- rotation ----------------------------------------------------------
+    def test_rotates_to_the_next_provider_on_429(self):
+        calls = self._stub({
+            "groq": (429, {}, {"error": {"message": "Rate limit reached for requests per day"}}),
+            "cerebras": self._ok("answered by cerebras"),
+        })
+        out = self.pool.complete([{"role": "user", "content": "hi"}], tier="fast")
+        self.assertEqual(out["provider"], "cerebras")
+        self.assertEqual(out["content"], "answered by cerebras")
+        self.assertEqual({c["url"].split("/")[2] for c in calls}, {"api.groq.com", "api.cerebras.ai"})
+
+    def test_daily_quota_cooldown_survives_until_the_reset_and_persists(self):
+        self._stub({"groq": (429, {}, {"error": {"message": "daily quota exceeded"}}),
+                    "cerebras": self._ok("fine")})
+        self.pool.complete([{"role": "user", "content": "hi"}])
+        cooling, left, reason = self.pool.cooling("groq")
+        self.assertTrue(cooling)
+        self.assertGreater(left, 60, "a daily quota must not be retried immediately")
+        self.assertLessEqual(left, 24 * 3600, "and never longer than LLM_COOLDOWN_HOURS")
+        self.assertIn("quota", reason)
+        self.assertTrue(Path(self.pool.state_file).is_file(), "cooldowns must survive a restart")
+        reloaded = self.lp.LlmPool(state_file=self.pool.state_file)
+        self.assertTrue(reloaded.cooling("groq")[0])
+
+    def test_retry_after_header_shortens_the_cooldown(self):
+        self._stub({"groq": (429, {"retry-after": "7"}, {"error": {"message": "too many requests"}}),
+                    "cerebras": self._ok("fine")})
+        self.pool.complete([{"role": "user", "content": "hi"}])
+        _cooling, left, _reason = self.pool.cooling("groq")
+        self.assertLessEqual(left, 120,
+                         "Retry-After: 7 must not become a 24h exile (the pool floors it at ~30s)")
+
+    def test_auth_failure_exiles_the_provider(self):
+        self._stub({"groq": (401, {}, {"error": {"message": "invalid api key"}}),
+                    "cerebras": self._ok("fine")})
+        self.pool.complete([{"role": "user", "content": "hi"}])
+        self.assertTrue(self.pool.cooling("groq")[0])
+        self.assertIn("auth", self.pool.cooling("groq")[2])
+
+    def test_reset_brings_providers_back(self):
+        self._stub({"groq": (429, {}, {"error": {"message": "rate limit"}}), "cerebras": self._ok("x")})
+        self.pool.complete([{"role": "user", "content": "hi"}])
+        self.assertTrue(self.pool.cooling("groq")[0])
+        self.pool.reset("groq")
+        self.assertFalse(self.pool.cooling("groq")[0])
+
+    def test_cooling_provider_is_skipped_without_a_request(self):
+        calls = self._stub({"groq": (429, {}, {"error": {"message": "daily quota"}}), "cerebras": self._ok("x")})
+        self.pool.complete([{"role": "user", "content": "hi"}])
+        before = len(calls)
+        self.pool.complete([{"role": "user", "content": "hi again"}])
+        self.assertFalse(any("api.groq.com" in c["url"] for c in calls[before:]),
+                         "a cooled-down provider must not be poked every turn")
+
+    def test_missing_keys_say_so_instead_of_searching(self):
+        for name in list(self._env_backup):
+            os.environ.pop(name, None)
+        with self.assertRaises(self.lp.NoProviderConfigured):
+            self.pool.complete([{"role": "user", "content": "hi"}])
+
+    def test_native_tool_calls_are_parsed(self):
+        self._stub({"groq": self._ok("", [{"id": "c1", "function": {
+            "name": "system_report", "arguments": json.dumps({"detailed": True})}}])})
+        out = self.pool.complete([{"role": "user", "content": "stats"}], tools=[{"type": "function"}])
+        self.assertEqual(out["tool_calls"][0]["name"], "system_report")
+        self.assertEqual(out["tool_calls"][0]["arguments"], {"detailed": True})
+
+    def test_stringified_arguments_and_usage_are_tolerated(self):
+        self._stub({"groq": (200, {}, {"choices": [{"message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "x", "function": {"name": "get_time", "arguments": "{}"}}]}}],
+            "usage": {"total_tokens": 12}})})
+        out = self.pool.complete([{"role": "user", "content": "time"}])
+        self.assertEqual(out["tool_calls"][0]["name"], "get_time")
+        self.assertEqual(out["usage"]["total_tokens"], 12)
+
+    def test_cloudflare_uses_account_url_and_bearer_token(self):
+        os.environ["CLOUDFLARE_API_TOKEN"] = "cf-token"
+        os.environ["CLOUDFLARE_ACCOUNT_ID"] = "acc-123"
+        try:
+            calls = self._stub({"groq": (429, {}, {"error": {"message": "daily quota"}}),
+                                "cerebras": (429, {}, {"error": {"message": "daily quota"}}),
+                                "cloudflare": self._ok("cf says hi")})
+            pool = self.lp.LlmPool(state_file=Path(self._tmp_state()))
+            out = pool.complete([{"role": "user", "content": "hi"}], tier="fast")
+            self.assertEqual(out["content"], "cf says hi")
+            self.assertIn("accounts/acc-123/ai/run/@cf/meta/", calls[-1]["url"])
+            self.assertEqual(calls[-1]["auth"], "Bearer cf-token")
+        finally:
+            os.environ.pop("CLOUDFLARE_API_TOKEN", None)
+            os.environ.pop("CLOUDFLARE_ACCOUNT_ID", None)
+
+    def test_custom_endpoint_joins_the_rotation(self):
+        os.environ["CUSTOM_LLM_BASE_URL"] = "https://integrate.api.nvidia.com/v1/chat/completions"
+        os.environ["CUSTOM_LLM_API_KEY"] = "nvapi-demo"
+        os.environ["CUSTOM_LLM_MODEL_FAST"] = "meta/llama-3.1-8b-instruct"
+        try:
+            self.lp.ensure_custom()
+            spec = self.lp.PROVIDERS["custom"]
+            self.assertEqual(spec.base_url, "https://integrate.api.nvidia.com/v1",
+                             "a pasted /chat/completions URL must be normalised")
+            self.assertEqual(spec.smart_model, "meta/llama-3.1-8b-instruct",
+                             "without a SMART id the FAST one covers both tiers")
+            self.assertIn("custom", self.pool.configured())
+            self.assertEqual(self.lp.order()[0], "custom", "a hand-picked endpoint should be tried first")
+            self._stub({"custom": self._ok("nim says hi"),
+                        "groq": (429, {}, {"error": {"message": "daily quota"}}),
+                        "cerebras": (429, {}, {"error": {"message": "daily quota"}})})
+            pool = self.lp.LlmPool(state_file=Path(self._tmp_state()))
+            out = pool.complete([{"role": "user", "content": "hi"}], tier="fast")
+            self.assertEqual(out["provider"], "custom")
+            self.assertEqual(out["content"], "nim says hi")
+        finally:
+            for name in ("CUSTOM_LLM_BASE_URL", "CUSTOM_LLM_API_KEY", "CUSTOM_LLM_MODEL_FAST"):
+                os.environ.pop(name, None)
+            self.lp.ensure_custom()
+            self.assertNotIn("custom", self.lp.PROVIDERS, "clearing the env must clear the slot")
+
+    def test_local_endpoint_needs_no_key_and_no_native_tools(self):
+        os.environ["CUSTOM_LLM_BASE_URL"] = "http://127.0.0.1:11434/v1"
+        os.environ["CUSTOM_LLM_TOOLS"] = "false"
+        os.environ.pop("CUSTOM_LLM_API_KEY", None)
+        try:
+            self.lp.ensure_custom()
+            spec = self.lp.PROVIDERS["custom"]
+            self.assertFalse(spec.supports_tools, "CUSTOM_LLM_TOOLS=false must disable native tools")
+            self.assertIn("custom", self.pool.configured(), "a LAN server has no api key")
+            sent = {}
+
+            def fake_post(url, headers, payload, timeout):
+                sent["url"] = url
+                sent["auth"] = headers.get("authorization", "<none>")
+                sent["tools"] = "tools" in payload
+                return self._ok("hello from ollama")      # _ok() already answers (status, headers, body)
+
+            self.lp._post_json = fake_post
+            out = self.lp.LlmPool(state_file=Path(self._tmp_state())).complete(
+                [{"role": "user", "content": "hi"}], tier="fast", tools=[{"type": "function"}])
+            self.assertEqual(out["content"], "hello from ollama")
+            self.assertEqual(sent["url"], "http://127.0.0.1:11434/v1/chat/completions")
+            self.assertEqual(sent["auth"], "<none>", "no Authorization header without a key")
+            self.assertFalse(sent["tools"], "support=false endpoints must not be given tool schemas")
+        finally:
+            for name in ("CUSTOM_LLM_BASE_URL", "CUSTOM_LLM_TOOLS"):
+                os.environ.pop(name, None)
+            self.lp.ensure_custom()
+
+    def test_status_reports_the_pool_not_a_single_model(self):
+        self._stub({"groq": self._ok("hi")})
+        self.pool.complete([{"role": "user", "content": "hi"}])
+        status = self.pool.status()
+        for key in ("order", "configured", "available", "providers", "cooldown_hours", "budget_seconds"):
+            self.assertIn(key, status)
+        self.assertTrue(any(p["key"] == "groq" for p in status["providers"]))
+
+    def test_network_failure_rests_the_pool(self):
+        def explode(url, headers, payload, timeout):
+            raise ConnectionError("unreachable")
+
+        self.lp._post_json = explode
+        with self.assertRaises(self.lp.LlmError):
+            self.pool.complete([{"role": "user", "content": "hi"}], tier="fast")
+        self.assertGreater(self.pool.status()["offline_rest_s"], 0,
+                           "no egress should not be re-probed on every utterance")
+
+
+class TestSiteAwareIntents(unittest.TestCase):
+    """"open google" is a website; "search X on youtube" searches youtube."""
+
+    def test_web_services_beat_the_browser(self):
+        plan = server.match_instant("open google")
+        self.assertEqual(plan["rule"], "open")
+        self.assertEqual(plan["calls"][0]["tool"], "open_website")
+        self.assertEqual(plan["calls"][0]["arguments"]["target"], "google")
+
+    def test_real_programs_still_launch(self):
+        for phrase in ("open chrome", "open google chrome", "open discord", "open spotify"):
+            plan = server.match_instant(phrase)
+            self.assertEqual(plan["calls"][0]["tool"], "launch_app", phrase)
+
+    def test_search_on_a_named_site_searches_that_site(self):
+        plan = server.match_instant("search LM Arena on Youtube")
+        call = plan["calls"][0]
+        self.assertEqual(call["tool"], "search_on_site")
+        self.assertEqual(call["arguments"]["query"], "LM Arena")
+        self.assertEqual(call["arguments"]["site"].lower(), "youtube")
+
+    def test_domain_spelling_works_too(self):
+        call = server.match_instant("search llm routers on google.com")["calls"][0]
+        self.assertEqual(call["tool"], "search_on_site")
+        self.assertEqual(call["arguments"]["query"], "llm routers")
+
+    def test_search_site_for_query_word_order(self):
+        call = server.match_instant("search youtube for lofi beats")["calls"][0]
+        self.assertEqual(call["tool"], "search_on_site")
+        self.assertEqual(call["arguments"]["query"], "lofi beats")
+
+    def test_play_on_another_service_uses_that_service(self):
+        call = server.match_instant("play lofi on spotify")["calls"][0]
+        self.assertEqual(call["tool"], "search_on_site")
+        self.assertEqual(call["arguments"]["site"], "spotify")
+
+    def test_plain_search_still_goes_straight_to_ddg(self):
+        call = server.match_instant("search cheapest indian restaurants in surat")["calls"][0]
+        self.assertEqual(call["tool"], "web_search")
+
+    def test_llm_status_is_instant(self):
+        for phrase in ("llm status", "check the ai providers", "who is your ai"):
+            plan = server.match_instant(phrase)
+            self.assertEqual(plan["calls"][0]["tool"], "llm_status", phrase)
+
+    def test_search_on_site_tool_reports_a_url(self):
+        result = tools.search_on_site("youtube", "LM Arena")
+        self.assertEqual(result["search_url"], "https://www.youtube.com/results?search_query=LM+Arena")
+        self.assertEqual(result["site"], "youtube")
+        self.assertIn("query", result)
+
+    def test_search_on_site_without_a_query_is_not_invented(self):
+        result = tools.search_on_site("youtube", "")
+        self.assertFalse(result["ok"])
+
+    def test_router_has_the_new_tools_bound(self):
+        names = {s["function"]["name"] for s in router.TOOL_SCHEMAS}
+        self.assertIn("search_on_site", names)
+        self.assertIn("llm_status", names)
+        self.assertEqual(len(router.TOOL_SCHEMAS), len(names), "schemas must stay unique")
+
+    def test_llm_endpoints_are_served(self):
+        if not HTTP_OK:
+            self.skipTest("httpx missing")
+        from fastapi.testclient import TestClient
+
+        client = TestClient(server.create_app())
+        payload = client.get("/api/llm").json()
+        self.assertIn("order", payload)
+        self.assertIn("providers", payload)
+        self.assertEqual(client.post("/api/llm/reset", json={"provider": "nope"}).json()["ok"], False)
+
+
+
+
+
+class TestAgentTrack(unittest.TestCase):
+    """Track 2 must actually call a provider, run the tool, then speak a summary."""
+
+    def setUp(self):
+        import llm_providers as lp
+
+        self.lp = lp
+        self._pool_singleton = lp.POOL
+        self._router_pool = router.POOL
+        self._post = lp._post_json
+        self._keys = {}
+        tmp = tempfile.mkdtemp(prefix="jarvis-agent-")
+        self._dir = tmp
+        self.pool = lp.LlmPool(state_file=Path(tmp) / "llm.json")
+        lp.POOL = self.pool
+        router.POOL = self.pool          # run_agent looks the name up on its own module
+        for name in ("CEREBRAS_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY", "OPENROUTER_API_KEY",
+                     "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "GITHUB_MODELS_TOKEN"):
+            self._keys[name] = os.environ.get(name)
+            os.environ.pop(name, None)
+        self._keys["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY")
+        os.environ["GROQ_API_KEY"] = "gsk-test"
+
+    def tearDown(self):
+        for name, value in self._keys.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.lp._post_json = self._post
+        self.lp.POOL = self._pool_singleton
+        router.POOL = self._router_pool
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    @staticmethod
+    def _content(text):
+        return {"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+
+    def test_tool_call_then_spoken_summary(self):
+        seen = []
+
+        def fake_post(url, headers, payload, timeout):
+            seen.append(payload)
+            if "tools" in payload and payload.get("tools"):
+                return 200, {}, {"choices": [{"message": {
+                    "role": "assistant", "content": "", "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {
+                            "name": "system_report", "arguments": json.dumps({"detailed": False})}}]},
+                    "finish_reason": "tool_calls"}]}
+            return 200, {}, self._content("CPU is at 12 percent and memory looks fine, sir.")
+
+        self.lp._post_json = fake_post
+        result = router.ROUTER.run_agent("how is my cpu doing")
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.track, "agent")
+        self.assertEqual(result.tool_calls[0]["tool"], "system_report")
+        self.assertEqual(result.answer, "CPU is at 12 percent and memory looks fine, sir.")
+        self.assertEqual(result.model.split(":")[0], "groq")
+        self.assertEqual(len(seen), 2, "the summary must be a second, tools-less call")
+        self.assertNotIn("tools", seen[1])
+        self.assertLessEqual(seen[1].get("max_tokens", 999), 400, "the summary should be capped and cheap")
+        # the tool result has to be fed back to the model, or it cannot summarise
+        self.assertIn("tool", [m.get("role") for m in seen[1]["messages"]])
+
+    def test_empty_completion_is_reported_not_invented(self):
+        self.lp._post_json = lambda url, headers, payload, timeout: (
+            200, {}, self._content("   "))
+        result = router.ROUTER.run_agent("tell me something")
+        self.assertFalse(result.ok)
+        self.assertIn("no tool call and no text", result.error)
+
+    def test_unanswered_question_is_not_routed_to_duckduckgo(self):
+        """With no key set, JARVIS admits it instead of quietly searching the web."""
+        os.environ.pop("GROQ_API_KEY", None)
+        self.pool.reset()
+        result = router.ROUTER.route("why is the sky blue")
+        self.assertFalse(result.ok)
+        self.assertTrue(any(word in result.answer.lower() for word in ("no key", "no ai", "provider")),
+                        result.answer)
+        self.assertNotIn("search", [c["tool"] for c in result.tool_calls or []])
+
+
+
+class TestHudMarkup(unittest.TestCase):
+    """The HUD is a pile of getElementById calls: one typo id silently kills a panel."""
+
+    STATIC = Path(__file__).resolve().parent.parent / "static"
+
+    def _pairs(self):
+        js = (self.STATIC / "arc_reactor.js").read_text(encoding="utf-8")
+        html = (self.STATIC / "index.html").read_text(encoding="utf-8")
+        ids = set(re.findall(r"""\$\(\s*['"]([\w-]+)['"]\s*\)""", js))
+        ids |= set(re.findall(r"""getElementById\(\s*['"]([\w-]+)['"]""", js))
+        return ids, set(re.findall(r'id="([\w-]+)"', html))
+
+    def test_every_id_the_js_touches_exists(self):
+        ids, have = self._pairs()
+        self.assertGreater(len(ids), 20, "the regex should be finding the HUD ids")
+        self.assertFalse(sorted(ids - have), f"arc_reactor.js looks up ids with no markup: {sorted(ids - have)}")
+
+    def test_provider_panel_is_wired(self):
+        ids, have = self._pairs()
+        for needed in ("llm-providers", "llm-tier", "llm-summary", "btn-llm-reset", "btn-llm-probe", "pill-model"):
+            self.assertIn(needed, have, f"{needed} missing from index.html")
+            self.assertIn(needed, ids, f"{needed} is in the markup but the JS never touches it")
+
+    def test_hud_has_no_localhost_hardcoding(self):
+        """The preview/proxy host changes; the client must use relative/derived origins."""
+        js = (self.STATIC / "arc_reactor.js").read_text(encoding="utf-8")
+        self.assertNotIn("ws://127.0.0.1", js.replace("http://127.0.0.1", ""), "hard-coded WS target")
+        self.assertIn("backendOrigin()", js, "origin must be derived so the HUD works from any host")
+
+    def test_styles_cover_the_new_classes(self):
+        css = (self.STATIC / "styles.css").read_text(encoding="utf-8")
+        for selector in (".state-pill", ".pill-model", ".chip", ".hud-panel", ".panel-title", ".meter"):
+            self.assertIn(selector, css, f"{selector} is used by the HUD but not styled")
+
 
 
 class TestWindowBootstrap(unittest.TestCase):

@@ -1482,6 +1482,272 @@ def system_power(action: str = "lock") -> Dict[str, Any]:
 # Public tool registry -- consumed by router.py to build the LLM's JSON schemas
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Web services ("open google" means google.com, not the browser)
+# ---------------------------------------------------------------------------
+
+#: Names that are *programs* first, web pages second. Anything below wins over
+#: :data:`SITE_ALIASES`, so "open chrome" still starts Chrome.
+APP_PREFERRED: set = {
+    "chrome", "google chrome", "browser", "web browser", "edge", "microsoft edge",
+    "firefox", "steam", "discord", "spotify", "eden", "notepad", "calculator",
+    "code", "vs code", "vscode", "terminal", "powershell", "explorer", "obs",
+    "paint", "settings", "task manager", "taskmgr", "whatsapp",
+}
+
+#: Web services the user can name directly. The value is what to open.
+SITE_ALIASES: Dict[str, str] = {
+    "google": "https://www.google.com",
+    "google search": "https://www.google.com",
+    "youtube": "https://www.youtube.com",
+    "yt": "https://www.youtube.com",
+    "youtube music": "https://music.youtube.com",
+    "gmail": "https://mail.google.com",
+    "google drive": "https://drive.google.com",
+    "drive": "https://drive.google.com",
+    "google docs": "https://docs.google.com",
+    "docs": "https://docs.google.com",
+    "google calendar": "https://calendar.google.com",
+    "google keep": "https://keep.google.com",
+    "google translate": "https://translate.google.com",
+    "maps": "https://maps.google.com",
+    "google maps": "https://maps.google.com",
+    "github": "https://github.com",
+    "gitlab": "https://gitlab.com",
+    "stackoverflow": "https://stackoverflow.com",
+    "stack overflow": "https://stackoverflow.com",
+    "reddit": "https://www.reddit.com",
+    "x": "https://x.com",
+    "twitter": "https://x.com",
+    "instagram": "https://www.instagram.com",
+    "facebook": "https://www.facebook.com",
+    "linkedin": "https://www.linkedin.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "chatgpt": "https://chatgpt.com",
+    "claude": "https://claude.ai",
+    "gemini": "https://gemini.google.com",
+    "perplexity": "https://www.perplexity.ai",
+    "netflix": "https://www.netflix.com",
+    "prime video": "https://www.primevideo.com",
+    "jio cinema": "https://www.jiocinema.com",
+    "hotstar": "https://www.hotstar.com",
+    "twitch": "https://www.twitch.tv",
+    "soundcloud": "https://soundcloud.com",
+    "bandcamp": "https://bandcamp.com",
+    "spotify web": "https://open.spotify.com",
+    "spotify": "https://open.spotify.com",
+    "amazon": "https://www.amazon.in",
+    "flipkart": "https://www.flipkart.com",
+    "meesho": "https://www.meesho.com",
+    "mdn": "https://developer.mozilla.org",
+    "caniuse": "https://caniuse.com",
+    "pypi": "https://pypi.org",
+    "npm": "https://www.npmjs.com",
+    "arxiv": "https://arxiv.org",
+    "google scholar": "https://scholar.google.com",
+    "kaggle": "https://www.kaggle.com",
+    "leetcode": "https://leetcode.com",
+    "hackerrank": "https://www.hackerrank.com",
+    "imdb": "https://www.imdb.com",
+    "letterboxd": "https://letterboxd.com",
+    "steam community": "https://steamcommunity.com",
+    "espncricinfo": "https://www.espncricinfo.com",
+    "cricbuzz": "https://www.cricbuzz.com",
+    "fpl": "https://fantasy.premierleague.com",
+    "notion": "https://www.notion.so",
+    "figma": "https://www.figma.com",
+    "web whatsapp": "https://web.whatsapp.com",
+    "whatsapp web": "https://web.whatsapp.com",
+    "web telegram": "https://web.telegram.org",
+    "outlook": "https://outlook.live.com",
+    "protonmail": "https://mail.proton.me",
+    "openrouter": "https://openrouter.ai",
+    "groq console": "https://console.groq.com",
+}
+
+#: Where a "search <thing> on <site>" should land. ``%s`` receives the query.
+#: Sites without an entry fall back to ``site:``-scoped DuckDuckGo results.
+SITE_SEARCH_URLS: Dict[str, str] = {
+    "google": "https://www.google.com/search?q=%s",
+    "google search": "https://www.google.com/search?q=%s",
+    "youtube": "https://www.youtube.com/results?search_query=%s",
+    "yt": "https://www.youtube.com/results?search_query=%s",
+    "youtube music": "https://music.youtube.com/search?q=%s",
+    "gmail": "https://mail.google.com/mail/u/0/#search/%s",
+    "maps": "https://www.google.com/maps/search/%s",
+    "google maps": "https://www.google.com/maps/search/%s",
+    "github": "https://github.com/search?q=%s",
+    "gitlab": "https://gitlab.com/search?search=%s",
+    "stackoverflow": "https://stackoverflow.com/search?q=%s",
+    "stack overflow": "https://stackoverflow.com/search?q=%s",
+    "reddit": "https://www.reddit.com/search/?q=%s",
+    "x": "https://x.com/search?q=%s",
+    "twitter": "https://x.com/search?q=%s",
+    "instagram": "https://www.instagram.com/explore/search/keyword/?q=%s",
+    "wikipedia": "https://en.wikipedia.org/w/index.php?search=%s",
+    "netflix": "https://www.netflix.com/search?q=%s",
+    "prime video": "https://www.primevideo.com/search/ref=atv_nb_sr?phrase=%s",
+    "twitch": "https://www.twitch.tv/search?term=%s",
+    "soundcloud": "https://soundcloud.com/search?q=%s",
+    "bandcamp": "https://bandcamp.com/search?q=%s",
+    "spotify web": "https://open.spotify.com/search/%s",
+    "spotify": "https://open.spotify.com/search/%s",
+    "amazon": "https://www.amazon.in/s?k=%s",
+    "flipkart": "https://www.flipkart.com/search?q=%s",
+    "meesho": "https://www.meesho.com/search?q=%s",
+    "mdn": "https://developer.mozilla.org/en-US/search?q=%s",
+    "pypi": "https://pypi.org/search/?q=%s",
+    "npm": "https://www.npmjs.com/search?q=%s",
+    "arxiv": "https://arxiv.org/abs/%s",
+    "google scholar": "https://scholar.google.com/scholar?q=%s",
+    "kaggle": "https://www.kaggle.com/search?q=%s",
+    "leetcode": "https://leetcode.com/problemset/all/?search=%s",
+    "hackerrank": "https://www.hackerrank.com/search?dim=demos&keywords=%s",
+    "imdb": "https://www.imdb.com/find/?q=%s",
+    "letterboxd": "https://letterboxd.com/search/%s/",
+    "steam community": "https://steamcommunity.com/search/?text=%s",
+    "notion": "https://www.notion.so",
+    "espncricinfo": "https://www.espncricinfo.com/search?query=%s",
+    "fpl": "https://fantasy.premierleague.com",
+}
+
+#: Domain-suffix -> canonical site key, so "on google.com" / "on youtube.com" work.
+_SITE_DOMAINS: Dict[str, str] = {
+    "google.com": "google", "youtube.com": "youtube", "youtu.be": "youtube",
+    "github.com": "github", "reddit.com": "reddit", "amazon.in": "amazon",
+    "amazon.com": "amazon", "flipkart.com": "flipkart", "wikipedia.org": "wikipedia",
+    "stackoverflow.com": "stackoverflow", "twitch.tv": "twitch", "netflix.com": "netflix",
+    "x.com": "x", "twitter.com": "twitter", "instagram.com": "instagram",
+    "soundcloud.com": "soundcloud", "imdb.com": "imdb", "leetcode.com": "leetcode",
+    "kaggle.com": "kaggle", "npmjs.com": "npm", "pypi.org": "pypi", "arxiv.org": "arxiv",
+    "mail.google.com": "gmail", "maps.google.com": "maps", "open.spotify.com": "spotify web",
+    "open.spotify.com": "spotify web", "spotify.com": "spotify web", "mdn.io": "mdn", "developer.mozilla.org": "mdn",
+    "stackexchange.com": "stackoverflow", "telegram.org": "web telegram",
+    "whatsapp.com": "web whatsapp", "linkedin.com": "linkedin", "notion.so": "notion",
+}
+
+
+def _site_key(name: str, allow_apps: bool = False) -> str:
+    """Normalise a spoken site ("YouTube", "youtube.com", "https://youtube.com")."""
+    raw = (name or "").strip().lower().rstrip(".,!?;")
+    raw = re.sub(r"^(?:the|on|in|at|www\.)+", "", raw)
+    raw = re.sub(r"^https?://", "", raw)
+    raw = re.sub(r"^(?:www|music|mail|maps|docs|drive)\.", "", raw)
+    raw = raw.split("/")[0].strip()
+    if raw in APP_PREFERRED and not allow_apps:
+        return ""           # "google chrome" is the browser, not google.com
+    if raw in SITE_ALIASES or raw in SITE_SEARCH_URLS:
+        return raw
+    if raw in _SITE_DOMAINS:
+        return _SITE_DOMAINS[raw]
+    # "youtube search", "on the youtube app", "google maps" and friends.
+    for key in sorted(SITE_ALIASES, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(key) + r"\b", raw):
+            return key
+    return ""
+
+
+def is_known_site(name: str, allow_apps: bool = False) -> bool:
+    """True when the words name a web service rather than an installed program.
+
+    ``allow_apps`` is for ``on <site>`` slots, where "play lofi on spotify" clearly
+    means Spotify's web search even though Spotify is also an installed app.
+    """
+    return bool(_site_key(name, allow_apps=allow_apps))
+
+
+def site_url(name: str, allow_apps: bool = False) -> str:
+    key = _site_key(name, allow_apps=allow_apps)
+    if not key:
+        return ""
+    if key in SITE_ALIASES:
+        return SITE_ALIASES[key]
+    slug = re.sub(r"[^a-z0-9]+", "", key)
+    return f"https://www.{slug}.com" if slug else ""
+
+
+def site_search_url(name: str, query: str, allow_apps: bool = False) -> str:
+    """Deep link straight into a site's own results page for ``query``."""
+    key = _site_key(name, allow_apps=allow_apps)
+    if not key or not query:
+        return ""
+    template = SITE_SEARCH_URLS.get(key) or ""
+    if not template:
+        for alias, url in SITE_SEARCH_URLS.items():
+            if alias.endswith(key) or key.endswith(alias):
+                template = url
+                break
+    if not template:
+        return ""
+    return template % _urlparse.quote_plus(query)
+
+
+def search_on_site(site: str, query: str, open_browser: bool = True) -> Dict[str, Any]:
+    """``search LM Arena on youtube`` / ``look X up on google.com``.
+
+    Opens the site's own results page *and* runs a ``site:``-scoped DuckDuckGo
+    search, so the browser shows the right thing and JARVIS can still speak an
+    answer when the search engine is reachable.
+    """
+    query = " ".join((query or "").split())
+    key = _site_key(site, allow_apps=True)
+    if not query:
+        return {"ok": False, "message": "Search for what? Tell me the words after \u201csearch\u201d."}
+    if not key:
+        # Unknown site name: treat it as a domain if it looks like one, else search the web.
+        guess = site.strip()
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]*(\.[a-z]{2,})+(/.*)?", guess.lower()):
+            url = f"https://{guess}"
+            return {**_open_url(url), "message": f"Opening {guess} (I do not have a search URL for it).",
+                    "query": query, "site": guess}
+        found = web_search(f"{query} {site}", max_results=5)
+        return {**found, "query": f"{query} {site}", "site": site,
+                "message": f"I do not know {site}'s search page, so I searched the web for \u201c{query} {site}\u201d."}
+
+    domain = (SITE_ALIASES.get(key, "").split("//")[-1] or "").split("/")[0]
+    scoped = web_search(query, max_results=5, site=domain) if domain else {"ok": False, "results": []}
+    url = site_search_url(key, query, allow_apps=True) or site_url(key, allow_apps=True)
+    opened = _open_url(url) if (url and open_browser) else {"ok": False, "message": "browser opening disabled"}
+    label = key.replace("-", " ").title()
+    results = scoped.get("results") or []
+    if results:
+        headline = f"{label} results for \u201c{query}\u201d: {results[0].get('title', '')}"
+    else:
+        headline = (f"Opened {label} search for \u201c{query}\u201d in the browser."
+                    if opened.get("ok") else
+                    f"I could not open {label}: {opened.get('message', 'no search page on file')}")
+    return {
+        "ok": bool(results) or bool(opened.get("ok")),
+        "message": headline,
+        "site": key,
+        "query": query,
+        "search_url": url,
+        "opened": bool(opened.get("ok")),
+        "results": results[:5],
+    }
+
+
+def llm_status() -> Dict[str, Any]:
+    """Report which AI providers are configured, live, or cooling down."""
+    try:
+        import llm_providers
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"provider layer unavailable: {exc}"}
+    status = llm_providers.POOL.status()
+    live = status.get("available") or []
+    cooling = [p for p in status.get("providers", []) if p.get("cooling")]
+    ready = status.get("configured") or []
+    if not ready:
+        lines = ["No AI provider key is set, so I am running on my regex rules and the offline planner."]
+    else:
+        lines = [f"AI providers ready: {', '.join(live) if live else 'none right now'}"
+                 + (f"; cooling: {', '.join(str(p['key']) + ' (' + str(max(1, int(p.get('cool_left_s', 0)) // 60)) + 'm)' for p in cooling)}" if cooling else "")]
+        if status.get("last_error"):
+            lines.append(f"Last error: {status['last_error']}")
+    return {"ok": True, "message": " ".join(lines), "llm": status}
+
+
+
 TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "launch_app": launch_app,
     "close_app": close_app,
@@ -1496,6 +1762,8 @@ TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "set_volume": set_volume,
     "take_screenshot": take_screenshot,
     "system_power": system_power,
+    "search_on_site": search_on_site,
+    "llm_status": llm_status,
 }
 
 

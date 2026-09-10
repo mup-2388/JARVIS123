@@ -84,15 +84,27 @@ def preflight() -> Dict[str, Any]:
         if example.is_file():
             shutil.copyfile(example, config.ENV_FILE)
 
+    import llm_providers
+
+    ready = llm_providers.POOL.configured()
+    report["llm_providers"] = ready
+    report["llm_status"] = llm_providers.POOL.status()
     missing = [
         key
         for key, value in (
-            ("HF_TOKEN", SETTINGS.hf_token),
             ("DISCORD_TOKEN", SETTINGS.discord_token),
             ("API_SPORTS_KEY", SETTINGS.api_sports_key),
         )
         if not value
     ]
+    if not ready:
+        log.warning(
+            "no AI provider key found -- JARVIS answers with its regex rules only. "
+            "Set one of GROQ_API_KEY, CEREBRAS_API_KEY, CLOUDFLARE_API_TOKEN+ACCOUNT_ID, "
+            "GEMINI_API_KEY, MISTRAL_API_KEY or OPENROUTER_API_KEY in .env"
+        )
+    else:
+        log.info("AI providers configured: %s", ", ".join(ready))
     report["missing_keys"] = missing
     if missing:
         log.info("optional keys not set (features degrade gracefully): %s", ", ".join(missing))
@@ -272,6 +284,17 @@ class JarvisBridge:
     def mirror(self, on: bool = True) -> Dict[str, Any]:
         return self._request("/api/discord/mirror", {"on": bool(on)})
 
+    def llm(self) -> Dict[str, Any]:
+        """Provider pool health: who is configured, who is cooling, until when."""
+        return self._request("/api/llm")
+
+    def llm_reset(self, provider: str = "") -> Dict[str, Any]:
+        return self._request("/api/llm/reset", {"provider": str(provider or "")})
+
+    def llm_probe(self) -> Dict[str, Any]:
+        # Probing walks every key with a real request, so allow a longer timeout.
+        return self._request("/api/llm/probe", {}, timeout=180.0)
+
     # -- window controls ---------------------------------------------------
     # -- window controls ---------------------------------------------------
     def _window_call(self, names: Tuple[str, ...], *args: Any) -> Dict[str, Any]:
@@ -326,6 +349,25 @@ class JarvisBridge:
 # Launch
 # ---------------------------------------------------------------------------
 
+def llm_row(report: Dict[str, Any]) -> str:
+    """One-line summary of the provider pool for the boot banner."""
+    status = report.get("llm_status") or {}
+    providers = status.get("providers") or []
+    live = status.get("available") or []
+    cooling = [p for p in providers if p.get("cooling")]
+    if not providers or not status.get("configured"):
+        return "no provider keys in .env -> heuristic planner (add GROQ_API_KEY etc.)"
+    detail = ", ".join(live) if live else "none available"
+    if len(live) == 1:
+        winner = next((p for p in providers if p.get("key") == live[0]), None)
+        if winner:
+            detail += f" (currently {winner.get('fast_model_used', '')})"
+    if cooling:
+        detail += "  | cooling: " + ", ".join(
+            f"{p['key']} {max(1, int(p.get('cool_left_s', 0)) // 60)}m" for p in cooling)
+    return detail
+
+
 def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
     rows = [
         ("core", f"http://127.0.0.1:{port}  (HUD at /, WS at /ws)"),
@@ -335,7 +377,7 @@ def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
         ("TTS", f"XTTSv2 · reference {'found' if report.get('reference_wav') else 'MISSING'} · low_vram={SETTINGS.tts_low_vram}"),
         ("ffmpeg", "present" if report.get("ffmpeg") else "MISSING (mic upload disabled)"),
         ("notes", f"{report.get('notes', 0)} file(s) in {SETTINGS.notes_path}"),
-        ("LLM", f"{SETTINGS.hf_model}" + ("" if SETTINGS.hf_token else "  (no HF_TOKEN -> heuristic planner)")),
+        ("LLM", llm_row(report)),
         ("discord", "token set" if SETTINGS.discord_token else "not configured"),
         ("api-sports", "key set" if SETTINGS.api_sports_key else "no key -> sports tool reports why"),
         ("mode", mode),

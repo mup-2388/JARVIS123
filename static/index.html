@@ -82,6 +82,7 @@
       <span id="pill-mode" class="state-pill pill-idle" data-mode="idle">IDLE</span>
       <span id="pill-track" class="state-pill pill-track" title="Track 1 = regex instant, Track 2 = agentic">—</span>
       <span id="pill-latency" class="state-pill pill-latency" title="last command latency">0 ms</span>
+      <span id="pill-model" class="state-pill pill-model" title="which brain answered last">—</span>
     </div>
 
     <div class="flex items-center gap-3 font-mono text-[10px] uppercase tracking-widest text-cyan-200/70">
@@ -129,6 +130,21 @@
         </div>
         <div class="meter"><span id="gpu-bar" class="meter-fill fill-blue"></span></div>
         <p id="gpu-detail" class="mt-2 font-mono text-[10px] text-cyan-100/70">querying nvidia-smi…</p>
+      </section>
+
+      <section class="hud-panel rounded-xl border border-cyan-500/30 bg-white/10 p-3 backdrop-blur-md" id="llm-panel">
+        <div class="flex items-center justify-between gap-2">
+          <h2 class="panel-title">AI providers</h2>
+          <div class="flex shrink-0 items-center gap-1.5 font-mono text-[9px] uppercase tracking-widest text-cyan-300/60">
+            <span id="llm-tier" class="chip chip-mini" title="model tier for the last call">auto</span>
+            <button id="btn-llm-reset" class="chip chip chip-mini" title="forget all 24h cooldowns">reset</button>
+            <button id="btn-llm-probe" class="chip chip chip-mini" title="ping every configured provider">probe</button>
+          </div>
+        </div>
+        <ul id="llm-providers" class="mt-2 space-y-[3px] font-mono text-[10px] text-cyan-100/80"></ul>
+        <p id="llm-summary" class="mt-2 border-t border-cyan-500/20 pt-2 font-mono text-[9.5px] leading-snug text-cyan-100/55">
+          no provider key in .env &mdash; add GROQ_API_KEY
+        </p>
       </section>
 
       <section class="hud-panel flex min-h-0 flex-1 flex-col rounded-xl border border-cyan-500/30 bg-white/10 p-3 backdrop-blur-md">

@@ -52,7 +52,7 @@ if "%REINSTALL%"=="1" (
 )
 
 if not exist ".env" (
-  echo [JARVIS] No .env found - copying .env.example. Add HF_TOKEN / DISCORD_TOKEN / API_SPORTS_KEY.
+  echo [JARVIS] No .env found - copying .env.example. Add GROQ_API_KEY (or another provider), DISCORD_TOKEN, API_SPORTS_KEY.
   copy /y ".env.example" ".env" >nul
   notepad ".env"
 )

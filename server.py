@@ -81,9 +81,36 @@ _CLOSE_RE = re.compile(
     r"^(?:please )?(?:close|quit|kill|exit|terminate|shut)\s+(?:the\s+|my\s+)?(?P<target>[a-z0-9 ._+-]{1,60}?)(?:\s+(?:app|application|down|now))?$",
     re.I,
 )
-_PLAY_RE = re.compile(r"^(?:please )?(?:play|put on|queue up|stream)\s+(?P<what>.+?)(?:\s+(?:on|in)\s+(?:youtube|yt|the youtube))?$", re.I)
+_PLAY_RE = re.compile(
+    r"^(?:please )?(?:play|put on|queue up|stream)\s+(?P<what>.+?)"
+    r"(?:\s+(?:on|in|at)\s+(?:the\s+|my\s+)?(?:youtube|yt|video|music))?$",
+    re.I,
+)
+#: "play X on spotify" -> that service's own search page, not YouTube.
+_PLAY_ON_SITE_RE = re.compile(
+    r"^(?:please )?(?:play|put on|queue up)\s+(?P<what>.+?)\s+(?:on|in|at)\s+(?P<site>[a-z][a-z0-9 ._-]{1,24}(?:\.[a-z]{2,})?)$",
+    re.I,
+)
+#: Explicit research verbs only.  "what is X" / "who is X" are NOT here on purpose:
+#: those are questions a language model can answer, and stealing them for DuckDuckGo
+#: is how the assistant ended up reading out search snippets for "explain quicksort".
 _SEARCH_RE = re.compile(
-    r"^(?:please )?(?:search(?: for)?|google|look up|find(?: out)?|what(?:'s| is| are)|how much is|price of|who is|who was)\s+(?P<q>.{2,180}?)[?.!]*$",
+    r"^(?:please )?(?P<verb>search(?: for)?|google|look up|find(?: out)?|check (?:the )?news about|news about|weather (?:in|for))\s+(?P<q>.{2,180}?)[?.!]*$",
+    re.I,
+)
+#: "search X on youtube" / "look X up on github" -> the site's own results page.
+_SEARCH_ON_SITE_RE = re.compile(
+    r"\b(?:on|in|at|using)\s+(?:the\s+|my\s+)?(?P<site>[a-z0-9][a-z0-9 ._-]{1,28}?(?:\.[a-z]{2,})?)"
+    r"\s*(?:\?|\.|!|,|$)",
+    re.I,
+)
+_SEARCH_FOR_RE = re.compile(r"\bsearch\s+(?P<site>[a-z][a-z0-9 ._-]{1,24}?)\s+for\s+(?P<q>.+)$", re.I)
+#: AI/provider health questions, answered from the pool without touching a model.
+_LLM_RE = re.compile(
+    r"\b(?:llm|ai)\s*(?:status|health|providers?|keys?|quota|limits?|brain)\b"
+    r"|\b(?:check|test|probe|ping)\s+(?:the\s+)?(?:ai|llm|providers?|models?)\b"
+    r"|\b(?:which|what)\s+(?:ai|model|provider|llm)\b.*\b(?:using|are you|is it|now)\b"
+    r"|\bwho(?:'s| is) your (?:ai|brain|model)\b",
     re.I,
 )
 _NOTE_READ_RE = re.compile(r"^(?:read|show|open|check|pull up|what do)\b.*?\bnotes?\b(?:.*?\babout|for|on)?\s*(?P<topic>[a-z0-9 äöüß ._+-]{0,60})$", re.I)
@@ -382,15 +409,19 @@ def _rule_open(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
     parts = split_clauses(target)
     primary = parts[0] if parts else target
     low = primary.lower()
-    if not (_looks_like_domain(low) or low in {"youtube", "yt"} or tools.is_known_app(primary)):
-        # Track 1 never guesses: unknown apps go to the agent.
+    # A named web service opens in the browser: "open google" means google.com,
+    # never Chrome.  Programs (chrome, discord, steam, eden...) win when the words
+    # really name one, which is why APP_PREFERRED is checked inside is_known_site.
+    as_site = tools.is_known_site(primary)
+    as_app = tools.is_known_app(primary)
+    site_first = bool(as_site) and low not in tools.APP_PREFERRED
+    if not (site_first or as_app or _looks_like_domain(low)):
+        # Track 1 never guesses: unknown targets go to the agent.
         return None
 
     calls: List[Tuple[str, Dict[str, Any]]] = []
-    if _looks_like_domain(low):
+    if _looks_like_domain(low) or site_first:
         calls.append(("open_website", {"target": primary, "query": ""}))
-    elif low in {"youtube", "yt"}:
-        calls.append(("open_website", {"target": "youtube", "query": ""}))
     else:
         url_hint = re.search(r"\b(?:at|to|on)\s+(https?://\S+|\S+\.\w{2,}(?:/\S*)?)\b", text, re.I)
         calls.append(("launch_app", {"app_name": primary,
@@ -404,12 +435,18 @@ def _rule_open(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
             calls.append(("play_youtube", {"query": play.group(1).strip(" ?.")}))
         elif re.search(r"\b(cpu|ram|gpu|vram|memory|disk|ssd|battery|temp|temperature|status|load|usage|telemetry|diagnostics)\b", rest_low):
             calls.append(("system_report", {"detailed": True}))
-        elif re.search(r"\b(search|google|look up|find out|find)\b", rest_low):
-            query = re.sub(r"^.*?\b(?:search|google|look up|find out|find)\b\s+(?:for\s+)?", "", rest_low, flags=re.I).strip(" ?.")
-            if query:
-                calls.append(("web_search", {"query": query, "max_results": 5, "timelimit": "", "site": ""}))
-            else:
+        elif re.search(r"\b(search|google|look up|find out)\b", rest_low):
+            query = re.sub(r"^.*?\b(?:search|google|look up|find out)\b\s+(?:for\s+)?", "", rest, flags=re.I).strip(" ?.")
+            if not query:
                 unparsed.append(rest_low)
+            else:
+                on_site = _SEARCH_ON_SITE_RE.search(query)
+                if on_site and (tools.is_known_site(on_site.group("site")) or "." in on_site.group("site")):
+                    head = query[: on_site.start()].strip(" ?.,")
+                    calls.append(("search_on_site", {"site": on_site.group("site").strip(),
+                                                     "query": head, "open_browser": True}))
+                else:
+                    calls.append(("web_search", {"query": query, "max_results": 5, "timelimit": "", "site": ""}))
         elif re.search(r"\b(screenshot|screen ?shot)\b", rest_low):
             calls.append(("take_screenshot", {}))
         elif _DICTATE_LEAD.match(rest_low):
@@ -439,7 +476,11 @@ def _rule_open(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
     else:
         plan_note = ""
     if len(calls) == 1 and low in {"youtube", "yt"} and parts[1:]:
-        calls = [("play_youtube", {"query": parts[1].strip(" ?.")})]
+        extra = " ".join(parts[1:])
+        site_tail = _SEARCH_ON_SITE_RE.search(extra)
+        if site_tail and tools.is_known_site(site_tail.group("site")) and site_tail.group("site").split(".")[0] in {"youtube", "yt"}:
+            extra = extra[: site_tail.start()].strip(" ?.,")
+        calls = [("play_youtube", {"query": extra.strip(" ?.")})]
     plan = _calls(*calls)
     plan["answer_prefix"] = f"Opening {primary}." if len(calls) > 1 else ""
     if plan_note:
@@ -466,15 +507,50 @@ def _rule_play(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
     what = (m.group("what") or "").strip(" ?.")
     if not what:
         return _calls(("open_website", {"target": "youtube", "query": ""}))
+    on_site = _PLAY_ON_SITE_RE.search(text or "")
+    if on_site:
+        site = on_site.group("site").strip()
+        if tools.is_known_site(site, allow_apps=True) and tools._site_key(site) not in {"youtube", "yt"}:
+            return _calls(("search_on_site", {"site": site, "query": on_site.group("what").strip(" ?."),
+                                             "open_browser": True}))
     return _calls(("play_youtube", {"query": what}))
 
 
 def _rule_search(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    """``search X``, ``google X``, ``search X on youtube``, ``search youtube for X``.
+
+    A named site wins over the generic web search: the user asked to look *there*, so
+    JARVIS opens that site's results page (and searches it via ``site:`` for the
+    spoken part) instead of dropping a query containing the words "on youtube".
+    """
     query = (m.group("q") or "").strip(" ?.,")
     if len(query) < 3:
         return None
+    # "search LM Arena on youtube" -> site is the trailing phrase, not part of the query.
+    tail = _SEARCH_ON_SITE_RE.search(query)
+    if tail:
+        site = tail.group("site").strip()
+        if tools.is_known_site(site):
+            head = query[: tail.start()].strip(" ?.,")
+            if len(head) >= 2:
+                return _calls(("search_on_site", {"site": site, "query": head, "open_browser": True}))
+        elif "." in site:                      # "on google.com" for a site we do not know
+            head = query[: tail.start()].strip(" ?.,")
+            if len(head) >= 2:
+                return _calls(("search_on_site", {"site": site, "query": head, "open_browser": True}))
+    # "search youtube for LM Arena"
+    for_prefix = _SEARCH_FOR_RE.search(text or "")
+    if for_prefix and tools.is_known_site(for_prefix.group("site")):
+        return _calls(("search_on_site", {"site": for_prefix.group("site").strip(),
+                                          "query": for_prefix.group("q").strip(" ?.,"),
+                                          "open_browser": True}))
     recent = re.search(r"\b(latest|today|breaking|news)\b", text, re.I)
     return _calls(("web_search", {"query": query, "max_results": 6, "timelimit": "d" if recent else "", "site": ""}))
+
+
+def _rule_llm(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
+    """Who is driving the brain right now - no model call needed to answer."""
+    return _calls(("llm_status", {}))
 
 
 def _rule_note_read(m: re.Match[str], text: str) -> Optional[Dict[str, Any]]:
@@ -604,6 +680,7 @@ INSTANT_RULES: List[Rule] = [
     ("telemetry", _TELEMETRY_RE, _rule_telemetry),
     ("power", _POWER_RE, _rule_power),
     ("wake", _WAKEUP_RE, _rule_wake),
+    ("llm", _LLM_RE, _rule_llm),
     ("search", _SEARCH_RE, _rule_search),
 ]
 
@@ -716,7 +793,8 @@ async def handle_command(
             answer = plan.get("answer", "")
             return await _finish(text, answer, "instant", started, speak, source, [])
         result = await execute_plan(plan, text)
-        return await _finish(text, result.answer, "instant", started, speak, source, result.tool_calls, pending=result.pending)
+        return await _finish(text, result.answer, "instant", started, speak, source, result.tool_calls,
+                             pending=result.pending, model=result.model)
 
     # --- Track 2 (agentic) ---------------------------------------------------
     _STATE["agent_hits"] += 1
@@ -737,6 +815,7 @@ async def handle_command(
         pending=result.pending,
         error=result.error,
         sources=result.sources,
+        model=result.model,
     )
 
 
@@ -751,6 +830,7 @@ async def _finish(
     pending: Optional[Dict[str, Any]] = None,
     error: str = "",
     sources: Optional[List[str]] = None,
+    model: str = "",
 ) -> Dict[str, Any]:
     latency = int((time.perf_counter() - started) * 1000)
     _STATE["last_latency_ms"] = latency
@@ -768,6 +848,10 @@ async def _finish(
         "tool_calls": tool_calls or [],
         "sources": list(sources or [])[:6],
         "card": pending,
+        # which brain answered: "groq:llama-3.1-8b-instant" for Track 2, "local-regex-planner"
+        # for an instant rule. The HUD shows it in the header pill so "did this go to the AI?"
+        # is answerable at a glance instead of by reading logs.
+        "model": model,
         "speak": bool(speak),
         "source": source,
         "at": datetime.now().strftime("%H:%M:%S"),
@@ -967,7 +1051,7 @@ def create_app() -> FastAPI:
             "discord": {**_STATE["discord"], **(BRIDGE.status() if BRIDGE else {})},
             "mirror": _STATE["mirror"],
             "voice": voice.status(),
-            "brain": router.ROUTER.brain.status(),
+            "brain": {**router.ROUTER.status()["brain"], "tools_bound": len(router.TOOL_SCHEMAS)},
             "pending_confirm": bool(_STATE["pending_confirm"]),
             "last_error": _STATE["last_error"],
         }
@@ -1070,6 +1154,31 @@ def create_app() -> FastAPI:
         reply = await handle_command(transcript.text, source=source, speak=SETTINGS.speak_replies)
         return {"ok": True, "transcript": transcript.as_dict(), "reply": reply}
 
+    # ---------------- AI providers -------------------------------------------
+    @app.get("/api/llm")
+    async def get_llm() -> Dict[str, Any]:
+        """Pool health: who is configured, who is live, who is cooling down and why."""
+        import llm_providers
+
+        return {"ok": True, **llm_providers.POOL.status()}
+
+    @app.post("/api/llm/reset")
+    async def post_llm_reset(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+        """Forget cooldowns (all providers, or one via ``{"provider": "groq"}``)."""
+        import llm_providers
+
+        provider = str((payload or {}).get("provider", "") or "")
+        if provider and provider not in llm_providers.PROVIDERS:
+            return {"ok": False, "error": f"unknown provider {provider!r}", "known": sorted(llm_providers.PROVIDERS)}
+        return llm_providers.POOL.reset(provider)
+
+    @app.post("/api/llm/probe")
+    async def post_llm_probe() -> Dict[str, Any]:
+        """Ping every configured provider with a one-word prompt."""
+        import llm_providers
+
+        return await asyncio.to_thread(llm_providers.POOL.probe)
+
     @app.get("/api/discord/status")
     async def discord_status() -> Dict[str, Any]:
         live = BRIDGE.status() if BRIDGE else {}
@@ -1125,7 +1234,7 @@ def create_app() -> FastAPI:
                         "speak_replies": SETTINGS.speak_replies,
                         "instant_rules": [name for name, _, _ in INSTANT_RULES],
                         "voice": voice.status(),
-                        "brain": router.ROUTER.brain.status(),
+                        "brain": {**router.ROUTER.status()["brain"], "tools_bound": len(router.TOOL_SCHEMAS)},
                         "apps": sorted(tools.available_apps()),
                         "log": TERMINAL.lines[-40:],
                     },

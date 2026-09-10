@@ -17,7 +17,10 @@ websockets>=12.0
 pywebview>=5.1
 
 # --- LLM brain (Track 2, agentic) ------------------------------------------
-huggingface-hub[inference]>=0.23
+# No package needed: JARVIS talks to Groq / Cerebras / Cloudflare / Gemini /
+# Mistral / OpenRouter / GitHub Models over their OpenAI-compatible HTTPS
+# endpoints with stdlib urllib (see llm_providers.py), so there is no vendor SDK
+# to pin and no Hugging Face dependency at all.
 
 # --- Live tools -------------------------------------------------------------
 # NOTE: upstream renamed the package to `ddgs` (same API, new name). tools.py

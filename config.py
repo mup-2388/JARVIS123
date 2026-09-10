@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List
 
 # --------------------------------------------------------------------------- paths
 ROOT: Path = Path(__file__).resolve().parent
@@ -109,15 +110,40 @@ def _resolve(raw: str) -> Path:
 # --------------------------------------------------------------------------- settings
 @dataclass(frozen=True)
 class Settings:
-    # LLM / agent track
-    hf_token: str = field(default_factory=lambda: dotenv("HF_TOKEN"))
-    hf_model: str = field(default_factory=lambda: dotenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3"))
-    hf_provider: str = field(default_factory=lambda: dotenv("HF_PROVIDER", "auto"))
-    hf_timeout: int = field(default_factory=lambda: _coerce_int(dotenv("HF_TIMEOUT_SECONDS"), 45))
-    hf_max_retries: int = field(default_factory=lambda: _coerce_int(dotenv("HF_MAX_RETRIES"), 2))
-    hf_max_tokens: int = field(default_factory=lambda: _coerce_int(dotenv("HF_MAX_TOKENS"), 700))
-    hf_temperature: float = field(default_factory=lambda: _coerce_float(dotenv("HF_TEMPERATURE"), 0.2))
-    allow_offline_agent: bool = field(default_factory=lambda: _coerce_bool(dotenv("ALLOW_OFFLINE_AGENT"), False))
+    # LLM providers (Track 2 brain).  Keys live in .env; every provider below
+    # has a real free tier, and llm_providers.py rotates between them so one
+    # vendor's quota can never silence JARVIS.
+    groq_api_key: str = field(default_factory=lambda: dotenv("GROQ_API_KEY"))
+    cerebras_api_key: str = field(default_factory=lambda: dotenv("CEREBRAS_API_KEY"))
+    cloudflare_api_token: str = field(default_factory=lambda: dotenv("CLOUDFLARE_API_TOKEN"))
+    cloudflare_account_id: str = field(default_factory=lambda: dotenv("CLOUDFLARE_ACCOUNT_ID"))
+    gemini_api_key: str = field(default_factory=lambda: dotenv("GEMINI_API_KEY"))
+    mistral_api_key: str = field(default_factory=lambda: dotenv("MISTRAL_API_KEY"))
+    openrouter_api_key: str = field(default_factory=lambda: dotenv("OPENROUTER_API_KEY"))
+    github_token: str = field(default_factory=lambda: dotenv("GITHUB_TOKEN"))
+
+    llm_provider: str = field(default_factory=lambda: dotenv("LLM_PROVIDER", "auto"))
+    llm_order: str = field(default_factory=lambda: dotenv(
+        "LLM_PROVIDER_ORDER", "groq,cerebras,cloudflare,gemini,mistral,openrouter,github"))
+    llm_timeout: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_TIMEOUT_SECONDS"), 30))
+    llm_max_tokens: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_MAX_TOKENS"), 700))
+    llm_temperature: float = field(default_factory=lambda: _coerce_float(dotenv("LLM_TEMPERATURE"), 0.2))
+    #: How long a provider that just returned 429 / an auth error is dropped from
+    #: rotation.  Shorter windows (RPM throttles, Retry-After hints) are honoured
+    #: automatically; this is the ceiling for "come back tomorrow" quotas.
+    llm_cooldown_hours: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_COOLDOWN_HOURS"), 24))
+    llm_tier_mode: str = field(default_factory=lambda: dotenv("LLM_TIER_MODE", "auto"))   # auto|fast|smart
+    llm_state_file: str = field(default_factory=lambda: dotenv("LLM_STATE_FILE", "data/llm_state.json"))
+    #: When no provider can answer, may the offline planner use web_search for
+    #: fact-shaped questions?  True keeps JARVIS useful; false makes it say "no AI".
+    llm_fallback_search: bool = field(default_factory=lambda: _coerce_bool(dotenv("LLM_FALLBACK_SEARCH"), True))
+    llm_probe_timeout: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_PROBE_TIMEOUT_SECONDS"), 12))
+    #: Hard wall-clock ceiling for one "ask the AI" turn across *all* providers.
+    #: Better a heuristic answer in 25 s than a frozen mic for 3 minutes.
+    llm_budget_seconds: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_BUDGET_SECONDS"), 25))
+    #: After two providers fail on the network (no egress / DNS / captive portal),
+    #: rest the whole pool this long instead of re-probing every turn.
+    llm_offline_cooldown: int = field(default_factory=lambda: _coerce_int(dotenv("LLM_OFFLINE_COOLDOWN_SECONDS"), 180))
 
     instant_track_enabled: bool = field(default_factory=lambda: _coerce_bool(dotenv("INSTANT_TRACK_ENABLED"), True))
     agent_min_chars: int = field(default_factory=lambda: _coerce_int(dotenv("AGENT_MIN_CHARS"), 3))
@@ -186,14 +212,37 @@ class Settings:
         return CACHE_DIR
 
     @property
-    def llm_ready(self) -> bool:
-        return bool(self.hf_token)
+    def llm_state_path(self) -> Path:
+        return _resolve(self.llm_state_file)
+
+    @property
+    def llm_keys_set(self) -> List[str]:
+        """Provider names this machine has credentials for (in rotation order)."""
+        pairs = (
+            ("groq", self.groq_api_key, ""),
+            ("cerebras", self.cerebras_api_key, ""),
+            ("cloudflare", self.cloudflare_api_token, self.cloudflare_account_id),
+            ("gemini", self.gemini_api_key, ""),
+            ("mistral", self.mistral_api_key, ""),
+            ("openrouter", self.openrouter_api_key, ""),
+            ("github", self.github_token, ""),
+        )
+        wanted = [n.strip().lower() for n in re.split(r"[,\s]+", self.llm_order) if n.strip()] or [p[0] for p in pairs]
+        out = []
+        for name in wanted:
+            for key, token, extra in pairs:
+                if key == name and token and (not extra or extra):
+                    out.append(key)
+        return out
 
     def redacted(self) -> Dict[str, Any]:
         """Safe view for the HUD / Discord ``/status`` style replies."""
         return {
-            "hf_model": self.hf_model,
-            "hf_token_set": bool(self.hf_token),
+            "llm_provider": self.llm_provider,
+            "llm_keys_set": self.llm_keys_set,
+            "llm_order": self.llm_order,
+            "llm_cooldown_hours": self.llm_cooldown_hours,
+            "llm_tier_mode": self.llm_tier_mode,
             "whisper": f"{self.whisper_model}/{self.whisper_device}/{self.whisper_compute_type}",
             "tts_enabled": self.tts_enabled,
             "tts_reference": str(self.reference_wav_path),

@@ -5,7 +5,7 @@ Pipeline for one utterance
 -------------------------
 1. Build the JARVIS system prompt (persona + today's date + hard tool rules)
    and prepend :class:`ConversationMemory` for follow-ups.
-2. Call a tool-calling model through ``huggingface_hub.InferenceClient`` with
+2. Call a tool-calling model through the provider pool in ``llm_providers``
    ``tools=TOOL_SCHEMAS`` (strict JSON schema: every property required,
    ``additionalProperties: false``, enums wherever the argument space is small).
 3. The model may answer directly, or emit one or more tool calls. Every call is
@@ -35,6 +35,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import tools
 from config import SETTINGS, get_logger
+from llm_providers import LlmError, POOL, choose_tier, looks_like_research
 
 log = get_logger("router")
 
@@ -67,6 +68,24 @@ def _fn(name: str, description: str, properties: Dict[str, Any], required: Optio
 
 
 TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    _fn(
+        "search_on_site",
+        "Run a search INSIDE a named web service and open its results page. Use this whenever the "
+        "user names a site: 'search LM Arena on YouTube', 'look that up on google.com', "
+        "'search spotify for lofi'. site accepts a name (youtube, google, github, reddit, amazon, "
+        "spotify, wikipedia, imdb...) or a domain (youtube.com).",
+        {
+            "site": {"type": "string", "description": "Site name or domain, e.g. 'youtube' or 'google.com'"},
+            "query": {"type": "string", "description": "What to search for, without the site words"},
+            "open_browser": {"type": "boolean", "description": "Open the results page in the browser"},
+        },
+    ),
+    _fn(
+        "llm_status",
+        "Report which AI providers are configured, which one answers, and which are cooling down "
+        "after hitting a quota. For 'which model are you using', 'AI status', 'check the providers'.",
+        {},
+    ),
     _fn(
         "launch_app",
         "Start a Windows application (Steam, Discord, the Eden emulator for FC 26, Chrome/Edge/Firefox, VS Code, Terminal, Spotify, Calculator...). "
@@ -228,6 +247,7 @@ ESSENTIAL_ARGS: Dict[str, Tuple[str, ...]] = {
     "open_website": ("target",),
     "play_youtube": ("query",),
     "web_search": ("query",),
+    "search_on_site": ("query",),
     "write_note": ("topic", "content"),
     "system_power": ("action",),
     "fetch_sports_stats": (),   # falls back to API_SPORTS_DEFAULT_TEAM
@@ -304,7 +324,13 @@ _KEYWORD_PLAN: List[Tuple[re.Pattern[str], str, Callable[[re.Match[str]], Dict[s
      "close_app", lambda m: {"app_name": m.group(2).strip()}),
     (re.compile(r"\b(play|put on|queue up)\b(?:\s+(?:the\s+|my\s+))?(.+?)(?:\s+on\s+youtube|\s+on\s+yt|\?|$)", re.I),
      "play_youtube", lambda m: {"query": (m.group(2) or "").strip(" .,?!")}),
-    (re.compile(r"\b(search|google|look up|find out|find|what(?:'s| is| are))\s+(?:for\s+)?(.+)", re.I),
+    # "search X on youtube" / "search youtube for X" - the named site owns it.
+    (re.compile(r"\b(?:search|look up|google)\b(?:\s+for)?\s+(?P<q>.+?)\s+(?:on|in|at)\s+(?P<site>[a-z][a-z0-9 ._-]{1,24}(?:\.[a-z]{2,})?)$", re.I),
+     "search_on_site", lambda m: {"site": (m.group("site") or "").strip(), "query": (m.group("q") or "").strip(" .?"), "open_browser": True}),
+    (re.compile(r"\bsearch\s+(?P<site>[a-z][a-z0-9 ._-]{1,24}?)\s+for\s+(?P<q>.+)$", re.I),
+     "search_on_site", lambda m: {"site": (m.group("site") or "").strip(), "query": (m.group("q") or "").strip(" .?"), "open_browser": True}),
+    # Explicit research verbs only: "what is X" is the model's job, not DDG's.
+    (re.compile(r"\b(search|google|look up|find out|news about|weather in)\s+(?:for\s+)?(.+)", re.I),
      "web_search", lambda m: {"query": re.sub(r"\b(please|for me|me)\b", "", m.group(2), flags=re.I).strip(" .?")}),
     (re.compile(r"\b(real madrid|barcelona|manchester city|manchester united|liverpool|arsenal|chelsea|bayern|dortmund|psg|juventus|milan|inter|mumbai city|bengaluru|kerala blasters)\b", re.I),
      "fetch_sports_stats", lambda m: {"team": m.group(1).title(), "kind": "all"}),
@@ -349,12 +375,12 @@ def _strip_fillers(text: str) -> str:
 _SPECIFICITY = {
     "write_note": 90, "read_notes": 88, "fetch_sports_stats": 86, "system_power": 84,
     "take_screenshot": 80, "set_volume": 78, "close_app": 74, "launch_app": 72,
-    "play_youtube": 70, "open_website": 60, "system_report": 58, "get_time": 55,
+    "play_youtube": 70, "search_on_site": 66, "open_website": 60, "system_report": 58, "get_time": 55,
     "web_search": 20,
 }
 
 
-def heuristic_plan(text: str) -> List[Dict[str, Any]]:
+def heuristic_plan(text: str, allow_search: bool = True) -> List[Dict[str, Any]]:
     """Deterministic intent → tool calls. Used offline and as a repair path."""
     calls: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -383,13 +409,15 @@ def heuristic_plan(text: str) -> List[Dict[str, Any]]:
         calls = [c for c in calls if c["tool"] != "read_notes"]  # dictation, not lookup
     if len(calls) > 3:
         calls = calls[:3]
-    if not calls and (text or "").strip():
+    if not calls and (text or "").strip() and allow_search:
+        # Only reached when the question genuinely needs the outside world; the agent -
+        # not this function - owns "what is X" style questions.
         calls.append({"tool": "web_search", "arguments": {"query": _clip(re.sub(r"^(hey[ ,]+)?jarvis[ ,]+", "", text, flags=re.I), 160), "max_results": 5, "timelimit": "", "site": ""}})
     return calls
 
 
 # ---------------------------------------------------------------------------
-# Hugging Face inference wrapper
+# Provider pool / tool-call parsing
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are J.A.R.V.I.S, a native Windows assistant with direct control of this machine.
@@ -401,155 +429,20 @@ Rules, in priority order:
 4. Only call system_power when the user explicitly asks to lock/sleep/shutdown/restart.
 5. After the tool result, answer in 1-3 short spoken sentences: concrete numbers first, no markdown, no preamble like "here is what I found".
 6. If no tool fits and you do not truly know the answer, say so in one line and suggest the tool you would need.
-7. For study requests, prefer read_notes; for anything factual prefer web_search.
+7. Study/revision questions read the user's own notes (read_notes). Live or verifiable facts
+   (scores, prices, news, "latest", anything after your cutoff) go to web_search - or
+   search_on_site when the user names a site ("search X on youtube", "look X up on google").
+8. Everything else - explanations, ideas, writing, translation, maths, opinions about their
+   code, "how do I", "what does X mean" - you answer YOURSELF from what you know. Do not call
+   web_search to be polite, and never claim you cannot answer when you actually can.
 
 Environment: Windows 11 desktop, RTX 3050 4 GB, local Whisper for input, XTTS-v2 for output.
 Today: {today} ({weekday}).
 """
 
 
-class HuggingFaceBrain:
-    """Thin, retry-safe wrapper over ``huggingface_hub.InferenceClient``."""
-
-    def __init__(self) -> None:
-        self._client = None
-        self._lock = threading.Lock()
-        self.model = SETTINGS.hf_model
-        self._last_error = ""
-        self._calls = 0
-        self._failures = 0
-        self._total_ms = 0
-
-    # -- client ------------------------------------------------------------
-    def available(self) -> bool:
-        return bool(SETTINGS.hf_token) or SETTINGS.allow_offline_agent
-
-    def _get_client(self):
-        with self._lock:
-            if self._client is not None:
-                return self._client
-            try:
-                from huggingface_hub import InferenceClient  # type: ignore
-            except Exception as exc:  # noqa: BLE001
-                self._last_error = f"huggingface-hub not importable: {exc}"
-                return None
-            kwargs: Dict[str, Any] = {"model": self.model, "timeout": SETTINGS.hf_timeout}
-            if SETTINGS.hf_token:
-                kwargs["token"] = SETTINGS.hf_token
-            try:
-                client = InferenceClient(**kwargs)
-            except TypeError:
-                # Older hub versions: no provider kwarg, model+token only.
-                client = InferenceClient(model=self.model, token=SETTINGS.hf_token or None)
-            except Exception as exc:  # noqa: BLE001
-                self._last_error = f"client init failed: {exc}"
-                return None
-            provider = SETTINGS.hf_provider
-            if provider and provider != "auto":
-                try:
-                    client.provider = provider  # type: ignore[attr-defined]
-                except Exception:  # noqa: BLE001
-                    pass
-            self._client = client
-            return client
-
-    # -- low level chat ----------------------------------------------------
-    def chat(
-        self,
-        messages: List[Dict[str, Any]],
-        tools_schema: Optional[List[Dict[str, Any]]] = None,
-        json_mode: bool = False,
-        max_tokens: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        client = self._get_client()
-        if client is None:
-            raise RuntimeError(self._last_error or "no HF client")
-
-        started = time.perf_counter()
-        last_exc: Optional[Exception] = None
-        for attempt in range(SETTINGS.hf_max_retries + 1):
-            kwargs: Dict[str, Any] = {
-                "messages": messages,
-                "temperature": SETTINGS.hf_temperature,
-                "max_tokens": max_tokens or SETTINGS.hf_max_tokens,
-                "top_p": 0.92,
-            }
-            if tools_schema:
-                kwargs["tools"] = tools_schema
-                kwargs["tool_choice"] = "auto"
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-            try:
-                resp = client.chat_completion(**kwargs)
-                self._calls += 1
-                self._total_ms += int((time.perf_counter() - started) * 1000)
-                return _normalise_completion(resp, int((time.perf_counter() - started) * 1000))
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                text = str(exc)
-                self._failures += 1
-                retryable = any(code in text for code in ("429", "500", "502", "503", "504", "RateLimit", "timeout", "Timeout"))
-                if attempt >= SETTINGS.hf_max_retries or not retryable:
-                    break
-                backoff = 1.6 * (2**attempt)
-                log.warning("HF call failed (%s) - retrying in %.1fs", _clip(text, 140), backoff)
-                time.sleep(backoff)
-        raise RuntimeError(f"{type(last_exc).__name__}: {last_exc}")
-
-    def status(self) -> Dict[str, Any]:
-        return {
-            "model": self.model,
-            "token_set": bool(SETTINGS.hf_token),
-            "calls": self._calls,
-            "failures": self._failures,
-            "avg_ms": int(self._total_ms / self._calls) if self._calls else 0,
-            "last_error": _clip(self._last_error, 200),
-            "tools_bound": len(TOOL_SCHEMAS),
-        }
-
-
-def _normalise_completion(resp: Any, latency_ms: int) -> Dict[str, Any]:
-    """Coerce the many shapes of a chat completion into ``{content, tool_calls}``."""
-    content, tool_calls, finish = "", [], ""
-    choice = None
-    try:
-        choices = getattr(resp, "choices", None) or (resp.get("choices") if isinstance(resp, dict) else None)
-        if choices:
-            choice = choices[0]
-    except Exception:  # noqa: BLE001
-        choice = None
-    if choice is not None:
-        message = getattr(choice, "message", None) or (choice.get("message") if isinstance(choice, dict) else None)
-        finish = getattr(choice, "finish_reason", None) or (choice.get("finish_reason") if isinstance(choice, dict) else "") or ""
-        if message is not None:
-            content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else "") or ""
-            raw_calls = getattr(message, "tool_calls", None) or (
-                message.get("tool_calls") if isinstance(message, dict) else None
-            )
-            tool_calls = list(raw_calls or [])
-        else:
-            content = getattr(choice, "text", "") or (choice.get("text") if isinstance(choice, dict) else "") or ""
-    else:
-        content = resp if isinstance(resp, str) else json.dumps(resp)[:2000]
-
-    parsed_calls: List[Dict[str, Any]] = []
-    for call in tool_calls:
-        fn = getattr(call, "function", None) or (call.get("function") if isinstance(call, dict) else None)
-        if not fn:
-            continue
-        name = getattr(fn, "name", None) or (fn.get("name") if isinstance(fn, dict) else "")
-        raw_args = getattr(fn, "arguments", None) or (fn.get("arguments") if isinstance(fn, dict) else "{}")
-        if isinstance(raw_args, str):
-            try:
-                raw_args = json.loads(raw_args or "{}")
-            except json.JSONDecodeError:
-                raw_args = _salvage_json(raw_args)
-        if name:
-            parsed_calls.append({"id": getattr(call, "id", None) or (call.get("id") if isinstance(call, dict) else "") or "",
-                                 "name": name, "arguments": raw_args if isinstance(raw_args, dict) else {}})
-    return {"content": content or "", "tool_calls": parsed_calls, "finish_reason": finish, "latency_ms": latency_ms}
-
-
+#: Some models wrap the tool call in a fenced block or pad it with prose, so the
+#: "answer with JSON" contract needs a tolerant extractor.
 _JSON_BLOCK = re.compile(r"\{.*\}", re.S)
 
 
@@ -626,13 +519,22 @@ class RouteResult:
 
 class Router:
     def __init__(self, memory: Optional[ConversationMemory] = None) -> None:
-        self.brain = HuggingFaceBrain()
+        #: :data:`llm_providers.POOL` rotates Groq / Cerebras / Cloudflare / Gemini /
+        #: Mistral / OpenRouter / GitHub Models and cools down whoever is out of quota.
+        self.brain = POOL
         self.memory = memory or MEMORY
         self._busy = threading.Lock()
+        self.last_model = ""
 
     # -- public ------------------------------------------------------------
     def route(self, text: str, prefer_agent: bool = False) -> RouteResult:
-        """Track 2 entry point. Track 1 (regex) lives in ``server.py``."""
+        """Track 2 entry point. Track 1 (regex) lives in ``server.py``.
+
+        The agent gets the first shot at everything that survived Track 1. The heuristic
+        planner is a *repair* path, not a shortcut to DuckDuckGo: it may only fall through
+        to a web search when the utterance is genuinely fact-shaped (see
+        :func:`llm_providers.looks_like_research`) and ``LLM_FALLBACK_SEARCH`` is on -
+        otherwise JARVIS says what is wrong instead of searching the word "hello"."""
         started = time.perf_counter()
         text = " ".join((text or "").split())
         if not text:
@@ -642,7 +544,17 @@ class Router:
         result = self.run_agent(text)
         if not result.ok:
             log.info("falling back to heuristic planner (%s)", _clip(result.error, 120))
-            result = self.run_tools(heuristic_plan(text), text, track="agent-heuristic")
+            allow_search = bool(SETTINGS.llm_fallback_search) and looks_like_research(text)
+            plan = heuristic_plan(text, allow_search=allow_search)
+            if plan:
+                result = self.run_tools(plan, text, track="agent-heuristic")
+            else:
+                # Name the reason in the HUD pill: "no provider key" and "all
+                # providers cooling" look identical to a user otherwise.
+                why = "no-provider-key" if "no LLM provider key" in (result.error or "") else "provider-unreachable"
+                result = RouteResult(ok=False, track="agent-heuristic", model=why,
+                                     answer=self._no_brain_answer(result.error),
+                                     error=result.error, speak=True)
         result.latency_ms = int((time.perf_counter() - started) * 1000)
         if result.answer:
             self.memory.add("assistant", result.answer, track=result.track,
@@ -651,8 +563,10 @@ class Router:
 
     # -- agentic loop --------------------------------------------------------
     def run_agent(self, text: str) -> RouteResult:
-        if not SETTINGS.hf_token and not SETTINGS.allow_offline_agent:
-            return RouteResult(ok=False, answer="", error="HF_TOKEN not set - heuristic planner used", model=self.brain.model)
+        if not POOL.configured():
+            return RouteResult(ok=False, answer="", model="",
+                               error="no LLM provider key configured - add one to .env (see LLM_PROVIDER_ORDER)")
+        tier = SETTINGS.llm_tier_mode if SETTINGS.llm_tier_mode in ("fast", "smart") else choose_tier(text)
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT.format(
                 today=datetime.now().strftime("%d %B %Y"), weekday=datetime.now().strftime("%A"))},
@@ -665,7 +579,8 @@ class Router:
         answer = ""
         try:
             for round_no in range(1, MAX_TOOL_ROUNDS + 1):
-                completion = self.brain.chat(messages, tools_schema=TOOL_SCHEMAS)
+                completion = POOL.complete(messages, tools=TOOL_SCHEMAS, tier=tier)
+                self.last_model = completion["provider"] + ":" + completion["model"]
                 content = completion["content"]
                 native_calls = completion["tool_calls"]
                 calls = list(native_calls) or ([c for c in [parse_tool_call_from_text(content)] if c])
@@ -673,10 +588,13 @@ class Router:
                 if not calls:
                     answer = _clean_answer(content)
                     if not answer and round_no == 1:
+                        # A hub that answers with an empty message is a real failure:
+                        # say so rather than claiming "Done." to the user.
+                        log.warning("%s returned an empty completion", completion["provider"])
                         return RouteResult(ok=False, answer="", error="model returned no tool call and no text",
-                                           model=self.brain.model)
+                                           model=self.last_model)
                     return RouteResult(ok=True, track="agent", answer=answer or "Done.", tool_calls=tool_log,
-                                       sources=sources, model=self.brain.model,
+                                       sources=sources, model=self.last_model,
                                        pending=_pending_payload(tool_log))
 
                 # Some hubs reject an assistant `tool_calls` message that they did
@@ -718,24 +636,39 @@ class Router:
                         messages.append({"role": "user", "content": f"TOOL_RESULT {tool or name}: {blob[:2600]}"})
 
                 # Ask for the spoken summary once tools have run.
-                final = self.brain.chat(
+                final = POOL.complete(
                     messages + [{"role": "user", "content": "Summarise the tool results above for the user in 1-3 short spoken sentences. No JSON, no tool call."}],
-                    tools_schema=None,
+                    tier="fast",
                     max_tokens=220,
                 )
+                self.last_model = final["provider"] + ":" + final["model"]
                 answer = _clean_answer(final["content"])
                 if answer:
                     return RouteResult(ok=True, track="agent", answer=answer, tool_calls=tool_log,
-                                       sources=sources, model=self.brain.model,
+                                       sources=sources, model=self.last_model,
                                        pending=_pending_payload(tool_log))
                 # No summary this round -> loop again (model may want another tool).
             return RouteResult(ok=True, track="agent", answer=answer or _spoken_from_tools(tool_log),
-                               tool_calls=tool_log, sources=sources, model=self.brain.model,
+                               tool_calls=tool_log, sources=sources, model=self.last_model,
                                pending=_pending_payload(tool_log))
-        except Exception as exc:  # noqa: BLE001 - any hub failure => offline planner
-            self.brain._last_error = f"{type(exc).__name__}: {exc}"
+        except LlmError as exc:  # every provider failed or is cooling -> planner
             log.warning("agent track unavailable: %s", _clip(str(exc), 200))
-            return RouteResult(ok=False, answer="", error=_clip(str(exc), 240), model=self.brain.model)
+            return RouteResult(ok=False, answer="", error=_clip(str(exc), 240), model=self.last_model)
+        except Exception as exc:  # noqa: BLE001 - unexpected bug: still degrade, never crash
+            log.warning("agent track errored: %s", _clip(str(exc), 200))
+            log.warning("agent track unavailable: %s", _clip(str(exc), 200))
+            return RouteResult(ok=False, answer="", error=_clip(str(exc), 240), model=self.last_model)
+
+    def _no_brain_answer(self, reason: str) -> str:
+        """What to say when no provider answered and a search would be nonsense."""
+        if "no LLM provider key" in (reason or ""):
+            return ("My AI brain has no key yet. Add one to .env - Groq is the quickest "
+                    "(console.groq.com/keys), then Cerebras, Cloudflare or Gemini - and restart me. "
+                    "Meanwhile I can still open apps, read your notes, report system stats, "
+                    "set the volume and take screenshots.")
+        return ("Every AI provider is busy or unreachable right now, so I did not guess. "
+                + ("Last error: " + _clip(reason, 140) + ". " if reason else "")
+                + "Ask me for the local stuff - notes, apps, system stats - or try again in a minute.")
 
     # -- direct execution (Track 1 reuses this) ------------------------------
     def run_tools(self, calls: List[Dict[str, Any]], utterance: str = "", track: str = "instant") -> RouteResult:
@@ -774,11 +707,11 @@ class Router:
     # -- diagnostics ---------------------------------------------------------
     def status(self) -> Dict[str, Any]:
         return {
-            "brain": self.brain.status(),
+            "brain": POOL.status(),
             "tools": sorted(TOOL_NAMES),
             "memory_turns": len(self.memory.snapshot()),
             "max_tool_rounds": MAX_TOOL_ROUNDS,
-            "offline_agent_allowed": SETTINGS.allow_offline_agent,
+            "fallback_search_allowed": SETTINGS.llm_fallback_search,
         }
 
 

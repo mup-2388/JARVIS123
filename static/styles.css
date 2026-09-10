@@ -182,6 +182,8 @@ body {
 .btn-danger { border-color: rgba(251, 113, 133, 0.4); color: #fecdd3; }
 .btn-danger:hover { background: rgba(251, 113, 133, 0.18); border-color: rgba(251, 113, 133, 0.75); color: #fff1f2; }
 
+.pill-model { max-width: 30ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pill-model-local { opacity: 0.55; }
 .chip { font-size: 9.5px; padding: 4px 9px; border-radius: 999px; }
 .chip-mini { padding: 2px 7px; font-size: 8.5px; }
 .chip-toggle.is-on {
