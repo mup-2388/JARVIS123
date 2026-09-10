@@ -139,9 +139,11 @@ function escapeHtml(value) {
 
 function formatAnswer(payload) {
   const answer = String(payload.answer ?? payload.text ?? '').trim();
+  const error = String(payload.error ?? payload.message ?? '').trim();
   const tools = Array.isArray(payload.tool_calls) ? payload.tool_calls.length : 0;
   const bits = [];
-  bits.push(answer ? escapeHtml(answer) : (payload.ok === false ? 'Failed.' : 'Done.'));
+  if (answer) bits.push(escapeHtml(answer));
+  else bits.push(error ? escapeHtml(error) : (payload.ok === false ? 'Failed.' : 'Done.'));
   const tags = [];
   if (payload.track) tags.push(payload.track);
   if (tools) tags.push(`${tools} tool${tools === 1 ? '' : 's'}`);

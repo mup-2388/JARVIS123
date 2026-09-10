@@ -52,7 +52,7 @@ def dataclass_replace(instance: Any, **changes: Any) -> Any:
     return dataclasses.replace(instance, **changes)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import config
 from config import SETTINGS, get_logger
@@ -1037,10 +1037,22 @@ class LlmPool:
                 break
         return out
 
-    def vision(self, prompt: str, images: List[str], *, question: str = "",
-               max_tokens: Optional[int] = None) -> Dict[str, Any]:
-        """:func:`complete` with an image, phrased the way the rest of JARVIS calls it."""
-        text = (question or prompt or "").strip() or "What is on this screen?"
+    def vision(self, prompt: Union[str, List[Dict[str, Any]]], images: List[str], *,
+               question: str = "", max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        """:func:`complete` with an image, phrased the way the rest of JARVIS calls it.
+
+        ``prompt`` is normally a plain string, but a list of OpenAI-style messages is
+        tolerated (its user turns' text is flattened) so a caller can never trip over
+        a ``'list' object has no attribute 'strip'`` crash again.
+        """
+        if isinstance(prompt, (list, tuple)):
+            text = " ".join(
+                str(item.get("content", "")) for item in prompt
+                if isinstance(item, dict)
+            ).strip()
+        else:
+            text = str(prompt or "").strip()
+        text = (question or "").strip() or text or "What is on this screen?"
         return self.complete([{"role": "user", "content": text}], images=list(images),
                              tier="smart", max_tokens=max_tokens)
 

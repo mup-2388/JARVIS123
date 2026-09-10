@@ -315,7 +315,7 @@ def describe(question: str = "", target: str = "screen", region: Optional[List[i
                        path=str(image))
     try:
         outcome = llm_providers.POOL.vision(
-            [{"role": "user", "content": ask}], images=[data_url],
+            ask, images=[data_url],
             max_tokens=min(700, max(180, SETTINGS.llm_max_tokens)))
     except llm_providers.LlmError as exc:
         return _result(False, f"No provider could look at the screen: {exc}", path=str(image),
