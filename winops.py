@@ -140,10 +140,10 @@ _PROTOTYPES = (
     ("user32", "SetProcessDPIAware", ctypes.c_bool, []),
     ("user32", "LockWorkStation", ctypes.c_bool, []),
     ("user32", "keybd_event", None, None),
-    ("user32", "Beep", ctypes.c_bool, [ctypes.c_uint, ctypes.c_uint]),
     ("user32", "GetAsyncKeyState", ctypes.c_short, [ctypes.c_int]),
     ("user32", "SetCursorPos", ctypes.c_bool, [ctypes.c_int, ctypes.c_int]),
     # kernel32
+    ("kernel32", "Beep", ctypes.c_bool, [ctypes.c_uint, ctypes.c_uint]),
     ("kernel32", "GetSystemPowerStatus", ctypes.c_bool, [ctypes.c_void_p]),
     ("kernel32", "SetConsoleCtrlHandler", ctypes.c_bool, [ctypes.c_void_p, ctypes.c_bool]),
 )
@@ -171,6 +171,7 @@ _WIN32_FEATURES = {
     "OpenClipboard": "clipboard read and write",
     "GetClipboardData": "clipboard read",
     "SetClipboardData": "pasting into another app",
+    "Beep": "the confirmation beep (winsound covers this one anyway)",
 }
 
 if IS_WINDOWS:  # pragma: no cover - exercised on the target machine
@@ -1216,12 +1217,46 @@ def win32_health() -> Dict[str, Any]:
     return _result(False, message, windows=True, missing=list(_WIN32_MISSING), disabled=disabled)
 
 
+def _winsound_beep(frequency: int, duration_ms: int) -> None:
+    """One beep through the standard library.
+
+    Split out so a test can verify the order of preference without the laptop actually making a
+    noise in the middle of ``python -m unittest``.
+    """
+    import winsound  # local import: standard library, Windows only
+
+    winsound.Beep(int(frequency), int(duration_ms))
+
+
 def beep(times: int = 1, frequency: int = 880, duration_ms: int = 120) -> Dict[str, Any]:
-    if not IS_WINDOWS or user32 is None:
+    """Beep on the PC speaker - a courtesy, so it may never cost the user a command.
+
+    ``winsound`` goes first because the standard library already knows this call; the raw entry
+    point is the fallback.  Both are guarded: a beep that cannot happen should appear as a line in
+    ``python winops.py``, not as an exception inside "open settings".  Asking user32 for ``Beep``
+    was the old bug - that name is exported by kernel32, while user32 has ``MessageBeep``.
+    """
+    if not IS_WINDOWS:
         return _result(True, "(beep simulated)", simulated=True)
-    for _ in range(max(1, min(times, 6))):
-        user32.Beep(int(frequency), int(duration_ms))
-    return _result(True, "Beeped.")
+    count = max(1, min(int(times or 1), 6))
+    freq, ms = int(frequency), max(10, min(int(duration_ms or 120), 5000))
+    reasons: List[str] = []
+    try:
+        for _ in range(count):
+            _winsound_beep(freq, ms)
+        return _result(True, "Beeped.", method="winsound", times=count)
+    except Exception as exc:  # noqa: BLE001
+        reasons.append("winsound: " + repr(exc))
+    if kernel32 is not None:
+        try:
+            for _ in range(count):
+                kernel32.Beep(freq, ms)  # type: ignore[union-attr]
+            return _result(True, "Beeped.", method="kernel32", times=count)
+        except Exception as exc:  # noqa: BLE001
+            reasons.append("kernel32!Beep: " + repr(exc))
+    else:
+        reasons.append("kernel32 not loaded")
+    return _result(False, "No beep available (" + "; ".join(reasons) + ").")
 
 
 def temp_path(suffix: str = ".png") -> Path:
@@ -1326,8 +1361,37 @@ def key_down(vk: int) -> bool:
         return False
 
 
-def check() -> Dict[str, Any]:
+def describe_probe(label: str, out: Any) -> Dict[str, Any]:
+    """Turn any probe's return value into one self-check row, whatever shape it came back in.
+
+    The desktop primitives deliberately disagree about shape - ``windows()`` returns a list,
+    ``battery()`` a result dict, ``uwp_apps()``/``app_paths()``/``installed_exes()`` a bare
+    ``{name: target}`` mapping - and the first version read only ``message``, so three rows printed
+    nothing on the first run on real hardware.  A blank row is worse than no row: it reads as
+    "checked, nothing to report" when it actually means "we did not know how to say this".
+    """
+    if isinstance(out, dict):
+        if "ok" in out or "message" in out:
+            ok = bool(out.get("ok", True))
+            message = str(out.get("message", "")).strip()
+            if not message:
+                message = "reported a failure without saying why" if not ok else "done"
+            return {"name": label, "ok": ok, "message": message[:220]}
+        return {"name": label, "ok": True, "message": "%d entries" % len(out)}
+    if isinstance(out, (list, tuple, set)):
+        return {"name": label, "ok": True, "message": "%d entries" % len(out)}
+    if out is None:
+        return {"name": label, "ok": False, "message": "returned nothing"}
+    return {"name": label, "ok": True, "message": str(out)[:220]}
+
+
+def check(light: bool = False) -> Dict[str, Any]:
     """Run every read-only desktop probe and report what each one can actually do.
+
+    ``light`` skips the rows that take seconds on a real desktop - the Start Menu, Store, registry
+    and Program Files enumerations (each one a PowerShell or registry walk) and the screen grab -
+    so the unit suite stays quick on Windows while ``python winops.py`` still checks everything.
+    On the laptop the skipped ones were nine seconds of the twenty a full run takes.
 
     ``python winops.py`` prints this table.  It launches nothing, clicks nothing and touches no
     file outside a temp PNG, so it is safe to run at any moment - and it is the thing to paste when
@@ -1337,7 +1401,11 @@ def check() -> Dict[str, Any]:
     """
     rows: List[Dict[str, Any]] = []
 
-    def probe(label: str, call: Callable[[], Any], windows_only: bool = False) -> None:
+    def probe(label: str, call: Callable[[], Any], windows_only: bool = False,
+              heavy: bool = False) -> None:
+        if heavy and light:
+            rows.append({"name": label, "ok": True, "message": "skipped - light check"})
+            return
         if windows_only and not IS_WINDOWS:
             # Reporting a Windows-only probe as a failure on another OS teaches the wrong lesson:
             # the point of this table is to separate "not here" from "broken here".
@@ -1348,25 +1416,20 @@ def check() -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - a probe that raises is exactly what we want to see
             rows.append({"name": label, "ok": False, "message": f"raised {type(exc).__name__}: {exc}"})
             return
-        if isinstance(out, dict):
-            rows.append({"name": label, "ok": bool(out.get("ok", True)),
-                         "message": str(out.get("message", ""))[:220]})
-        elif isinstance(out, list):
-            rows.append({"name": label, "ok": True, "message": f"{len(out)} entries"})
-        else:
-            rows.append({"name": label, "ok": out is not None, "message": str(out)[:220]})
+        rows.append(describe_probe(label, out))
 
     probe("win32 bindings", win32_health)
     probe("screen size", lambda: {"ok": all(screen_size()), "message": " x ".join(map(str, screen_size()))}, windows_only=True)
     probe("window list", lambda: windows(), windows_only=True)
     probe("foreground window", foreground_window, windows_only=True)
-    probe("start menu entries", lambda: start_menu_entries(), windows_only=True)
-    probe("store apps (UWP)", lambda: uwp_apps(), windows_only=True)
-    probe("app paths registry", lambda: app_paths(), windows_only=True)
-    probe("installed programs", lambda: installed_exes(), windows_only=True)
+    probe("start menu entries", lambda: start_menu_entries(), windows_only=True, heavy=True)
+    probe("store apps (UWP)", lambda: uwp_apps(), windows_only=True, heavy=True)
+    probe("app paths registry", lambda: app_paths(), windows_only=True, heavy=True)
+    probe("installed programs", lambda: installed_exes(), windows_only=True, heavy=True)
     probe("battery", battery, windows_only=True)
     probe("clipboard", clipboard_read, windows_only=True)
-    probe("screen grab", lambda: screenshot(str(temp_path(".png"))), windows_only=True)
+    probe("screen grab", lambda: screenshot(str(temp_path(".png"))), windows_only=True,
+          heavy=True)
     probe("input injection", lambda: {"ok": True, "message": "SendInput bound"}
           if "user32!SendInput" not in _WIN32_MISSING else {"ok": False, "message": "SendInput missing"})
     problems = [row for row in rows if not row["ok"]]
@@ -1377,7 +1440,7 @@ def check() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":  # pragma: no cover - a human runs this on the target machine
-    report = check()
+    report = check(light="--fast" in sys.argv or "-f" in sys.argv)
     print(f"\nJARVIS desktop self-check  ({'Windows' if IS_WINDOWS else 'not Windows'})\n" + "-" * 66)
     for row in report["rows"]:
         print(f"  [{'ok' if row['ok'] else 'XX'}] {row['name']:<22} {row['message']}")

@@ -13,7 +13,9 @@ so a normal install has it).
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import dataclasses
 import inspect
 import json
 import os
@@ -1073,9 +1075,6 @@ class TestModelFallback(unittest.TestCase):
 
     def setUp(self):
         EnvOnly.install(self)          # .env on this box may hold real keys
-
-        import dataclasses
-
         import llm_providers as lp
 
         self.lp = lp
@@ -1097,6 +1096,14 @@ class TestModelFallback(unittest.TestCase):
         os.environ["GROQ_API_KEY"] = "gsk-test"
         self.list_calls = []
         lp._get_json = self._fake_get
+        # Two of these tests assert that discovery ran during the turn, and LLM_AUTO_DISCOVER=false
+        # in a real .env would switch that off for them.  EnvOnly hides the file from later reads,
+        # but config.SETTINGS was frozen at import - so the class owns the switch itself, on a
+        # copy, instead of inheriting whatever the machine happens to have configured.
+        patch = mock.patch.object(lp, "SETTINGS",
+                                  dataclasses.replace(config.SETTINGS, llm_auto_discover=True))
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def tearDown(self):
         for name, value in self._env.items():
@@ -1753,7 +1760,8 @@ class TestWin32Bindings(unittest.TestCase):
         "OpenClipboard": "user32", "CloseClipboard": "user32", "EmptyClipboard": "user32",
         "IsClipboardFormatAvailable": "user32", "GetClipboardData": "user32", "SetClipboardData": "user32",
         "SendInput": "user32", "keybd_event": "user32", "GetAsyncKeyState": "user32",
-        "SetCursorPos": "user32", "GetCursorPos": "user32", "Beep": "user32",
+        "SetCursorPos": "user32", "GetCursorPos": "user32",
+        "Beep": "kernel32",   # WinBase.h; user32's similar name is MessageBeep
     }
 
     @staticmethod
@@ -1810,7 +1818,7 @@ class TestWin32Bindings(unittest.TestCase):
         probes were skipped rather than pretending success), and it must list every subsystem the
         laptop has broken before - bindings, windows, app index, screen grab.
         """
-        report = winops.check()
+        report = winops.check(light=True)   # the enumerations cost seconds on a real desktop
         self.assertIn("rows", report)
         names = {row["name"] for row in report["rows"]}
         for needed in ("win32 bindings", "window list", "start menu entries", "screen size"):
@@ -1821,6 +1829,58 @@ class TestWin32Bindings(unittest.TestCase):
             self.assertTrue(any("not on Windows" in row["message"] or "skipped" in row["message"]
                                for row in report["rows"]),
                             "skipped probes must be marked as skipped, not left out")
+
+    def test_no_self_check_row_is_allowed_to_be_blank(self):
+        """The bug the laptop reported: three rows printed nothing.
+
+        ``uwp_apps``/``app_paths``/``installed_exes`` answer with a bare ``{name: target}`` mapping,
+        which has no ``message`` key, so the formatter printed an empty string - and an empty line
+        in a diagnostics table reads as "checked and fine".
+        """
+        self.assertEqual(winops.describe_probe("uwp", {"Teams": "x", "Edge": "y"}),
+                         {"name": "uwp", "ok": True, "message": "2 entries"})
+        self.assertEqual(winops.describe_probe("windows", [])["message"], "0 entries")
+        self.assertEqual(winops.describe_probe("grab", None),
+                         {"name": "grab", "ok": False, "message": "returned nothing"})
+        plain = winops.describe_probe("thing", {"ok": False})
+        self.assertIn("without saying why", plain["message"])
+        # End-to-end as well, because the blank rows only appeared in the real table.  The other
+        # Windows probes are faked here so this stays fast on a laptop - a diagnostics test that
+        # spends nine seconds enumerating the Start Menu is a test people learn to skip.
+        cheap = {"start_menu_entries": lambda: [], "uwp_apps": lambda: {"a": "1"},
+                 "app_paths": lambda: {}, "installed_exes": lambda: {},
+                 "screenshot": lambda *_a, **_k: {"ok": True, "message": "captured"}}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(winops, "IS_WINDOWS", True))
+            for name, fn in cheap.items():
+                stack.enter_context(mock.patch.object(winops, name, fn))
+            rows = {row["name"]: row for row in winops.check()["rows"]}
+        self.assertEqual(rows["store apps (UWP)"]["message"], "1 entries",
+                         "a probe that answers with a mapping still has to print something")
+        self.assertTrue(all(row["message"].strip() for row in rows.values()),
+                        "no row in the self-check may be blank")
+
+    def test_beep_prefers_the_standard_library_and_never_raises(self):
+        heard = []
+        with mock.patch.object(winops, "IS_WINDOWS", True), \
+                mock.patch.object(winops, "_winsound_beep", lambda f, d: heard.append((f, d))):
+            out = winops.beep(times=2, frequency=700, duration_ms=90)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["method"], "winsound")
+        self.assertEqual(heard, [(700, 90), (700, 90)])
+
+        class Broken:
+            def Beep(self, *_a):
+                raise OSError("no waveform-out device")
+
+        def loud(*_a):
+            raise ImportError("no winsound on this box")
+
+        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops, "_winsound_beep", loud), \
+                mock.patch.object(winops, "kernel32", Broken()):
+            out = winops.beep()          # must answer, not raise - a beep is a courtesy
+        self.assertFalse(out["ok"])
+        self.assertIn("No beep available", out["message"])
 
     def test_launch_arguments_are_split_the_way_cmd_would(self):
         self.assertEqual(winops._split_args("--new-window \"C:\\My Docs\" x"),
@@ -1860,11 +1920,31 @@ class TestWin32Bindings(unittest.TestCase):
             out = winops.shell_execute("ms-settings:")
             self.assertTrue(out["ok"], out)
             self.assertEqual(out["method"], "shellexecute")
-        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops, "shell32", Refused()):
+        # A refusal is only final once the shell launchers have failed too - and on a real desktop
+        # explorer.exe *does* launch, so the fallback's outcome has to be supplied, not inherited
+        # from whatever the machine happens to have installed.
+        def nope(cmd, target=""):
+            return winops._result(False, "nothing would run it")
+
+        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops, "shell32", Refused()), \
+                mock.patch.object(winops, "_run_detached", nope):
             out = winops.shell_execute("C:\\secret\\x.txt")
-            self.assertFalse(out["ok"])
+            self.assertFalse(out["ok"], out)
             self.assertIn("access denied", out["message"])
             self.assertEqual(out["code"], 5)
+
+        rescued = []
+
+        def explorer_says_yes(cmd, target=""):
+            rescued.append(list(cmd))
+            return winops._result(True, f"Started {target}")
+
+        with mock.patch.object(winops, "IS_WINDOWS", True), mock.patch.object(winops, "shell32", Refused()), \
+                mock.patch.object(winops, "_run_detached", explorer_says_yes):
+            out = winops.shell_execute("C:\\secret\\x.txt")
+            self.assertTrue(out["ok"], "a fallback that worked is the truth, not a hidden failure")
+            self.assertEqual(rescued[0], ["explorer.exe", "C:\\secret\\x.txt"])
+            self.assertIn("access denied", out["message"], "and the reason stays in the sentence")
 
     def test_a_missing_entry_point_falls_back_to_the_shell(self):
         """The exact laptop failure: ctypes cannot resolve the name at all.

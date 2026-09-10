@@ -43,7 +43,7 @@ Markdown notes as a knowledge base, an agentic LLM brain and a Discord bridge.
 | `static/styles.css` | Meters, sparklines, terminal, pills, animations, scrollbar, webview chrome |
 | `static/arc_reactor.js` | WebGL render loop **and** the HUD client (WebSocket, telemetry, terminal, mic, cards) |
 | `notes/*.md` | Your study notes, read by `read_notes()` (German A2 + CS prep included as worked examples) |
-| `tests/test_jarvis.py` | 179 stdlib-unittest checks: schemas, regex precision, provider failover, app resolution, file journaling, screen ranking, wake gate, timers, REST |
+| `tests/test_jarvis.py` | 181 stdlib-unittest checks: schemas, regex precision, provider failover, app resolution, file journaling, screen ranking, wake gate, timers, REST |
 
 ## 2 · Setup (Windows)
 
@@ -222,7 +222,7 @@ Outbound: `hello`, `telemetry`, `log`, `state`, `reply`, `card`, `transcript`, `
 ## 6 · Verification
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover -s tests -v     # 179 cases, all offline; they pass with or without a key in .env
+.venv\Scripts\python.exe -m unittest discover -s tests -v     # 181 cases, all offline; they pass with or without a key in .env
 .venv\Scripts\python.exe -c "import router,json;print(json.dumps(router.TOOL_SCHEMAS[0],indent=2))"
 .venv\Scripts\python.exe -c "import llm_providers as l;print(l.POOL.configured() or 'NO KEYS');print(l.choose_tier('open steam'), l.choose_tier('compare the dative and accusative cases, then write a study plan'))"
 curl http://127.0.0.1:8760/api/telemetry
@@ -309,6 +309,7 @@ naming the feature each gap costs.  It launches nothing and writes nothing outsi
 
 ```powershell
 .venv\Scripts\python.exe winops.py      # and the same numbers appear in the HUD's desktop panel
+.venv\Scripts\python.exe winops.py --fast   # skip the Start Menu / Store / registry walks (seconds each)
 ```
 
 | Symptom | Cause → fix |
