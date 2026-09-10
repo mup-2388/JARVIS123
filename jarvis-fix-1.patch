@@ -1,0 +1,764 @@
+From 13262367e6ece45f66c2f3810fb2f4fba05b2509 Mon Sep 17 00:00:00 2001
+From: mup-2388 <288946382+mup-2388@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 19:16:21 +0000
+Subject: [PATCH] Fix screen vision crash, offline HUD fallback, and bar error
+ surfacing
+
+- llm_providers.vision(): accept a plain string OR a list of OpenAI-style
+  messages and flatten it before .strip(), so a caller can never trip over
+  "'list' object has no attribute 'strip'". screen.describe() now passes the
+  prompt string directly instead of a message list.
+- static/arc_reactor.js: Three.js loads via a guarded dynamic import and the
+  whole WebGL scene builds behind an `if (THREE)` guard, with null checks on
+  the renderer and setAnimationLoop. An offline laptop or a WebGL-blocklisted
+  GPU now degrades to the CSS HUD (terminal, telemetry, mic, TTS) instead of
+  killing the entire module at startup.
+- static/arc_reactor.js: attachPlaybackAnalyser no longer double-connects the
+  media element into the gain node when the mic analyser is not yet present.
+- static/bar.js: formatAnswer surfaces payload.error/payload.message so a
+  failed command explains itself rather than showing a bare "Failed.".
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ llm_providers.py      |  22 +-
+ screen.py             |   2 +-
+ static/arc_reactor.js | 609 ++++++++++++++++++++++--------------------
+ static/bar.js         |   4 +-
+ 4 files changed, 341 insertions(+), 296 deletions(-)
+
+diff --git a/llm_providers.py b/llm_providers.py
+index 19554be..642caf0 100644
+--- a/llm_providers.py
++++ b/llm_providers.py
+@@ -52,7 +52,7 @@ def dataclass_replace(instance: Any, **changes: Any) -> Any:
+     return dataclasses.replace(instance, **changes)
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+-from typing import Any, Dict, List, Optional, Tuple
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ import config
+ from config import SETTINGS, get_logger
+@@ -1037,10 +1037,22 @@ class LlmPool:
+                 break
+         return out
+ 
+-    def vision(self, prompt: str, images: List[str], *, question: str = "",
+-               max_tokens: Optional[int] = None) -> Dict[str, Any]:
+-        """:func:`complete` with an image, phrased the way the rest of JARVIS calls it."""
+-        text = (question or prompt or "").strip() or "What is on this screen?"
++    def vision(self, prompt: Union[str, List[Dict[str, Any]]], images: List[str], *,
++               question: str = "", max_tokens: Optional[int] = None) -> Dict[str, Any]:
++        """:func:`complete` with an image, phrased the way the rest of JARVIS calls it.
++
++        ``prompt`` is normally a plain string, but a list of OpenAI-style messages is
++        tolerated (its user turns' text is flattened) so a caller can never trip over
++        a ``'list' object has no attribute 'strip'`` crash again.
++        """
++        if isinstance(prompt, (list, tuple)):
++            text = " ".join(
++                str(item.get("content", "")) for item in prompt
++                if isinstance(item, dict)
++            ).strip()
++        else:
++            text = str(prompt or "").strip()
++        text = (question or "").strip() or text or "What is on this screen?"
+         return self.complete([{"role": "user", "content": text}], images=list(images),
+                              tier="smart", max_tokens=max_tokens)
+ 
+diff --git a/screen.py b/screen.py
+index 79d0f2f..731891e 100644
+--- a/screen.py
++++ b/screen.py
+@@ -315,7 +315,7 @@ def describe(question: str = "", target: str = "screen", region: Optional[List[i
+                        path=str(image))
+     try:
+         outcome = llm_providers.POOL.vision(
+-            [{"role": "user", "content": ask}], images=[data_url],
++            ask, images=[data_url],
+             max_tokens=min(700, max(180, SETTINGS.llm_max_tokens)))
+     except llm_providers.LlmError as exc:
+         return _result(False, f"No provider could look at the screen: {exc}", path=str(image),
+diff --git a/static/arc_reactor.js b/static/arc_reactor.js
+index 5846196..e0bb8d5 100644
+--- a/static/arc_reactor.js
++++ b/static/arc_reactor.js
+@@ -20,7 +20,16 @@
+    js_api bridge, so the panel degrades instead of dying.
+    ========================================================================== */
+ 
+-import * as THREE from 'three';
++/* Three.js is optional and loads from the CDN at runtime. If the CDN is
++   unreachable (e.g. an offline laptop) or WebGL cannot be created, the HUD
++   degrades to the CSS backdrop + terminal + telemetry + mic/TTS path instead
++   of crashing the whole module. */
++let THREE = null;
++try {
++  THREE = await import('three');
++} catch (error) {
++  console.warn('[JARVIS] Three.js unavailable — running the 2D HUD without the reactor renderer.', error);
++}
+ 
+ /* ------------------------------------------------------------------ helpers */
+ const $ = (id) => document.getElementById(id);
+@@ -62,190 +71,9 @@ const state = {
+   lastAnswer: '',
+ };
+ 
+-/* ==========================================================================
+-   1 · WEBGL — ARC REACTOR
+-   ========================================================================== */
+-
+-const canvas = $('reactor-canvas');
+-const renderer = new THREE.WebGLRenderer({
+-  canvas,
+-  antialias: true,
+-  alpha: true,
+-  powerPreference: 'high-performance',
+-});
+-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+-renderer.setSize(window.innerWidth, window.innerHeight, false);
+-renderer.toneMapping = THREE.ACESFilmicToneMapping;
+-renderer.toneMappingExposure = 1.16;
+-if ('outputColorSpace' in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+-
+-const scene = new THREE.Scene();
+-scene.fog = new THREE.FogExp2(0x04070d, 0.055);
+-
+-const camera = new THREE.PerspectiveCamera(55, window.innerWidth / Math.max(1, window.innerHeight), 0.1, 120);
+-camera.position.set(0, 0.9, 9.4);
+-
+-/* ---- lights (spec: AmbientLight + blue PointLight) ---------------------- */
+-const ambient = new THREE.AmbientLight(0x38bdf8, 0.42);
+-scene.add(ambient);
+-
+-const keyLight = new THREE.PointLight(0x2563eb, 7.5, 46, 2.0);   // the blue point light
+-keyLight.position.set(2.6, 3.4, 5.2);
+-scene.add(keyLight);
+-
+-const coreLight = new THREE.PointLight(0x22d3ee, 4.2, 20, 2.0); // cyan spill from the core
+-coreLight.position.set(0, 0, 0.4);
+-scene.add(coreLight);
+-
+-const rimLight = new THREE.DirectionalLight(0x67e8f9, 0.28);
+-rimLight.position.set(-4, -2, -3);
+-scene.add(rimLight);
+-
+-/* ---- the reactor --------------------------------------------------------- */
+-const reactor = new THREE.Group();
+-scene.add(reactor);
+-
+-const torusMaterial = new THREE.MeshStandardMaterial({
+-  color: 0x22d3ee,
+-  emissive: 0x0891b2,
+-  emissiveIntensity: 1.35,
+-  metalness: 0.35,
+-  roughness: 0.28,
+-  wireframe: true,
+-  transparent: true,
+-  opacity: 0.94,
+-});
+-const torus = new THREE.Mesh(new THREE.TorusGeometry(3.05, 0.34, 14, 96), torusMaterial);
+-reactor.add(torus);
+-
+-const innerRing = new THREE.Mesh(
+-  new THREE.TorusGeometry(2.18, 0.075, 8, 72),
+-  new THREE.MeshStandardMaterial({
+-    color: 0x67e8f9, emissive: 0x22d3ee, emissiveIntensity: 2.1,
+-    wireframe: true, transparent: true, opacity: 0.7,
+-  })
+-);
+-innerRing.rotation.x = Math.PI / 2;
+-reactor.add(innerRing);
+-
+-const outerRing = new THREE.Mesh(
+-  new THREE.TorusGeometry(3.85, 0.03, 6, 128),
+-  new THREE.MeshBasicMaterial({ color: 0x1e6fa8, wireframe: true, transparent: true, opacity: 0.55 })
+-);
+-outerRing.rotation.x = Math.PI * 0.5;
+-reactor.add(outerRing);
+-
+-/* electromagnetic coil ticks around the rim */
+-const coils = [];
+-const coilGeometry = new THREE.BoxGeometry(0.1, 0.42, 0.26);
+-for (let i = 0; i < 16; i += 1) {
+-  const material = new THREE.MeshStandardMaterial({
+-    color: 0x0e7490, emissive: 0x22d3ee, emissiveIntensity: 0.6,
+-    metalness: 0.8, roughness: 0.35, transparent: true, opacity: 0.9,
+-  });
+-  const coil = new THREE.Mesh(coilGeometry, material);
+-  const angle = (i / 16) * Math.PI * 2;
+-  coil.position.set(Math.cos(angle) * 3.05, Math.sin(angle) * 3.05, 0);
+-  coil.rotation.z = angle + Math.PI / 2;
+-  coil.userData.phase = i * 0.4;
+-  reactor.add(coil);
+-  coils.push(coil);
+-}
++/* ---- state-driven colour + energy (shared by renderer + HUD) ------------ */
++let wantedColor = null;   // THREE.Color once the renderer is up; null in 2D fallback
+ 
+-/* glowing plasma core */
+-const coreMaterial = new THREE.MeshStandardMaterial({
+-  color: 0xe0fbff,
+-  emissive: 0x22d3ee,
+-  emissiveIntensity: 2.4,
+-  metalness: 0.1,
+-  roughness: 0.08,
+-});
+-const core = new THREE.Mesh(new THREE.SphereGeometry(1.02, 48, 32), coreMaterial);
+-reactor.add(core);
+-
+-const coreShell = new THREE.Mesh(
+-  new THREE.SphereGeometry(1.42, 28, 18),
+-  new THREE.MeshBasicMaterial({ color: 0x22d3ee, wireframe: true, transparent: true, opacity: 0.16 })
+-);
+-reactor.add(coreShell);
+-
+-/* radial halo sprite (canvas gradient, no texture download needed) */
+-function haloTexture() {
+-  const size = 256;
+-  const cnv = document.createElement('canvas');
+-  cnv.width = cnv.height = size;
+-  const ctx = cnv.getContext('2d');
+-  const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+-  gradient.addColorStop(0.0, 'rgba(224,251,255,0.95)');
+-  gradient.addColorStop(0.28, 'rgba(34,211,238,0.45)');
+-  gradient.addColorStop(0.62, 'rgba(37,99,235,0.14)');
+-  gradient.addColorStop(1.0, 'rgba(0,0,0,0)');
+-  ctx.fillStyle = gradient;
+-  ctx.fillRect(0, 0, size, size);
+-  const texture = new THREE.CanvasTexture(cnv);
+-  if ('colorSpace' in texture) texture.colorSpace = THREE.SRGBColorSpace;
+-  return texture;
+-}
+-const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+-  map: haloTexture(),
+-  blending: THREE.AdditiveBlending,
+-  depthWrite: false,
+-  transparent: true,
+-  opacity: 0.85,
+-}));
+-halo.scale.set(11, 11, 1);
+-scene.add(halo);
+-
+-/* drifting particle field */
+-const PARTICLES = 520;
+-const positions = new Float32Array(PARTICLES * 3);
+-const seeds = new Float32Array(PARTICLES);
+-for (let i = 0; i < PARTICLES; i += 1) {
+-  const radius = 4.6 + Math.random() * 9.5;
+-  const angle = Math.random() * Math.PI * 2;
+-  positions[i * 3] = Math.cos(angle) * radius;
+-  positions[i * 3 + 1] = (Math.random() - 0.5) * 8.5;
+-  positions[i * 3 + 2] = Math.sin(angle) * radius - 2;
+-  seeds[i] = Math.random() * Math.PI * 2;
+-}
+-const particleGeometry = new THREE.BufferGeometry();
+-particleGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+-const particles = new THREE.Points(particleGeometry, new THREE.PointsMaterial({
+-  color: 0x7dd3fc, size: 0.055, sizeAttenuation: true,
+-  transparent: true, opacity: 0.65, blending: THREE.AdditiveBlending, depthWrite: false,
+-}));
+-scene.add(particles);
+-
+-/* ---- optional bloom (fails soft when the CDN path changes) ------------- */
+-let composer = null;
+-async function initBloom() {
+-  try {
+-    const [{ EffectComposer }, { RenderPass }, { UnrealBloomPass }, { OutputPass }] = await Promise.all([
+-      import('three/addons/postprocessing/EffectComposer.js'),
+-      import('three/addons/postprocessing/RenderPass.js'),
+-      import('three/addons/postprocessing/UnrealBloomPass.js'),
+-      import('three/addons/postprocessing/OutputPass.js'),
+-    ]);
+-    const next = new EffectComposer(renderer);
+-    next.addPass(new RenderPass(scene, camera));
+-    const bloom = new UnrealBloomPass(
+-      new THREE.Vector2(window.innerWidth, window.innerHeight),
+-      reducedMotion ? 0.35 : 0.72,   // strength
+-      0.75,                          // radius
+-      0.18                           // threshold
+-    );
+-    next.addPass(bloom);
+-    next.addPass(new OutputPass());
+-    composer = next;
+-    composer.bloom = bloom;
+-    log('sys', 'post-processing: unrealbloom online');
+-  } catch (error) {
+-    composer = null;
+-    log('warn', `bloom pass unavailable (${error.message}) — rendering without post-fx`);
+-  }
+-}
+-
+-/* ---- state-driven colour + energy --------------------------------------- */
+ const MODE_STYLE = {
+   idle:      { energy: 0.18, color: 0x22d3ee, label: 'arc reactor nominal' },
+   listening: { energy: 0.6,  color: 0x34d399, label: 'audio ingest · whisper listening' },
+@@ -254,15 +82,13 @@ const MODE_STYLE = {
+   error:     { energy: 1.25, color: 0xfb7185, label: 'fault reported — see terminal' },
+   boot:      { energy: 0.4,  color: 0x22d3ee, label: 'cold boot · loading models' },
+ };
+-const modeColor = new THREE.Color(0x22d3ee);
+-const wantedColor = new THREE.Color(0x22d3ee);
+ 
+ function setMode(mode, detail = '') {
+   const key = MODE_STYLE[mode] ? mode : 'idle';
+   state.mode = key;
+   const style = MODE_STYLE[key];
+   state.targetEnergy = reducedMotion ? style.energy * 0.5 : style.energy;
+-  wantedColor.setHex(style.color);
++  if (wantedColor) wantedColor.setHex(style.color);
+   const pill = $('pill-mode');
+   if (pill) {
+     pill.textContent = key.toUpperCase();
+@@ -281,115 +107,320 @@ function flash() {
+   setTimeout(() => el.classList.remove('on'), 90);
+ }
+ 
+-/* ---- pointer parallax --------------------------------------------------- */
+-const pointer = { x: 0, y: 0, tx: 0, ty: 0 };
+-window.addEventListener('pointermove', (event) => {
+-  pointer.tx = (event.clientX / window.innerWidth - 0.5) * 2;
+-  pointer.ty = (event.clientY / window.innerHeight - 0.5) * 2;
+-}, { passive: true });
+-window.addEventListener('blur', () => { pointer.tx = 0; pointer.ty = 0; });
+-
+-/* ---- resize ------------------------------------------------------------- */
+-function resize() {
+-  const width = Math.max(1, window.innerWidth);
+-  const height = Math.max(1, window.innerHeight);
+-  camera.aspect = width / height;
+-  camera.updateProjectionMatrix();
+-  renderer.setSize(width, height, false);
+-  if (composer) composer.setSize(width, height);
+-  const wave = $('waveform');
+-  if (wave) {
+-    wave.width = Math.floor(wave.clientWidth * Math.min(2, window.devicePixelRatio || 1));
+-    wave.height = Math.floor(wave.clientHeight * Math.min(2, window.devicePixelRatio || 1));
++/* ==========================================================================
++   1 · WEBGL — ARC REACTOR  (optional — guarded so the HUD survives a missing
++      CDN or a WebGL context failure)
++   ========================================================================== */
++
++let renderer = null;
++let scene = null;
++let camera = null;
++let reactor = null;
++let torus = null;
++let core = null;
++let composer = null;
++
++if (THREE) {
++  const canvas = $('reactor-canvas');
++  try {
++    renderer = new THREE.WebGLRenderer({
++      canvas,
++      antialias: true,
++      alpha: true,
++      powerPreference: 'high-performance',
++    });
++  } catch (error) {
++    console.warn('[JARVIS] WebGL context creation failed — HUD continues in 2D mode.', error);
++    renderer = null;
+   }
+-}
+-window.addEventListener('resize', resize);
+-if (window.ResizeObserver) new ResizeObserver(resize).observe(document.body);
+-
+-/* ---- the render loop ---------------------------------------------------- */
+-const clock = new THREE.Clock();
+-let frame = 0;
+-
+-function tick() {
+-  const dt = Math.min(0.05, clock.getDelta());
+-  const t = clock.elapsedTime;
+-  frame += 1;
+-
+-  // energy + colour ease toward the assistant state
+-  state.energy += (state.targetEnergy - state.energy) * clamp(dt * 3.4, 0, 1);
+-  modeColor.lerp(wantedColor, clamp(dt * 2.2, 0, 1));
+-
+-  const pulse = reducedMotion ? 0 : Math.sin(t * (2.6 + state.energy * 5.5));
+-  const breathe = 0.5 + 0.5 * pulse;
+-  const level = 0.35 + state.audioLevel * 0.9;             // live microphone gain
+-
+-  // continuous rotation: the signature idle spin, amplified while working
+-  reactor.rotation.y += dt * (0.16 + state.energy * 0.75);
+-  reactor.rotation.x = Math.sin(t * 0.22) * 0.14;
+-  torus.rotation.z -= dt * (0.1 + state.energy * 0.35);
+-  innerRing.rotation.z += dt * (0.5 + state.energy * 2.1);
+-  outerRing.rotation.y -= dt * (0.25 + state.energy * 0.6);
+-  coreShell.rotation.y -= dt * 0.55;
+-  coreShell.rotation.x += dt * 0.2;
+-
+-  // core + material response
+-  const glow = 1.6 + state.energy * 2.6 + breathe * 0.5 * (0.4 + state.energy) + level * 1.4;
+-  coreMaterial.emissive.copy(modeColor);
+-  coreMaterial.emissiveIntensity = glow;
+-  core.scale.setScalar(1 + state.energy * 0.05 + breathe * 0.012 + level * 0.05);
+-  torusMaterial.emissive.copy(modeColor).multiplyScalar(0.62);
+-  torusMaterial.emissiveIntensity = 0.9 + state.energy * 1.5 + level;
+-
+-  coils.forEach((coil, i) => {
+-    const local = Math.sin(t * (2.2 + state.energy * 3.2) + coil.userData.phase);
+-    coil.material.emissiveIntensity = 0.35 + Math.max(0, local) * (0.8 + state.energy * 2.4);
+-    coil.scale.z = 1 + Math.max(0, local) * 0.28 * (0.4 + state.energy);
+-    coil.material.emissive.copy(modeColor);
+-    if (i === 0) coil.visible = true;
++  if (renderer) {
++    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
++    renderer.setSize(window.innerWidth, window.innerHeight, false);
++    renderer.toneMapping = THREE.ACESFilmicToneMapping;
++    renderer.toneMappingExposure = 1.16;
++    if ('outputColorSpace' in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
++  }
++
++  scene = new THREE.Scene();
++  scene.fog = new THREE.FogExp2(0x04070d, 0.055);
++
++  camera = new THREE.PerspectiveCamera(55, window.innerWidth / Math.max(1, window.innerHeight), 0.1, 120);
++  camera.position.set(0, 0.9, 9.4);
++
++  /* ---- lights (spec: AmbientLight + blue PointLight) ---------------------- */
++  const ambient = new THREE.AmbientLight(0x38bdf8, 0.42);
++  scene.add(ambient);
++
++  const keyLight = new THREE.PointLight(0x2563eb, 7.5, 46, 2.0);   // the blue point light
++  keyLight.position.set(2.6, 3.4, 5.2);
++  scene.add(keyLight);
++
++  const coreLight = new THREE.PointLight(0x22d3ee, 4.2, 20, 2.0); // cyan spill from the core
++  coreLight.position.set(0, 0, 0.4);
++  scene.add(coreLight);
++
++  const rimLight = new THREE.DirectionalLight(0x67e8f9, 0.28);
++  rimLight.position.set(-4, -2, -3);
++  scene.add(rimLight);
++
++  /* ---- the reactor --------------------------------------------------------- */
++  reactor = new THREE.Group();
++  scene.add(reactor);
++
++  const torusMaterial = new THREE.MeshStandardMaterial({
++    color: 0x22d3ee,
++    emissive: 0x0891b2,
++    emissiveIntensity: 1.35,
++    metalness: 0.35,
++    roughness: 0.28,
++    wireframe: true,
++    transparent: true,
++    opacity: 0.94,
+   });
++  torus = new THREE.Mesh(new THREE.TorusGeometry(3.05, 0.34, 14, 96), torusMaterial);
++  reactor.add(torus);
++
++  const innerRing = new THREE.Mesh(
++    new THREE.TorusGeometry(2.18, 0.075, 8, 72),
++    new THREE.MeshStandardMaterial({
++      color: 0x67e8f9, emissive: 0x22d3ee, emissiveIntensity: 2.1,
++      wireframe: true, transparent: true, opacity: 0.7,
++    })
++  );
++  innerRing.rotation.x = Math.PI / 2;
++  reactor.add(innerRing);
++
++  const outerRing = new THREE.Mesh(
++    new THREE.TorusGeometry(3.85, 0.03, 6, 128),
++    new THREE.MeshBasicMaterial({ color: 0x1e6fa8, wireframe: true, transparent: true, opacity: 0.55 })
++  );
++  outerRing.rotation.x = Math.PI * 0.5;
++  reactor.add(outerRing);
++
++  /* electromagnetic coil ticks around the rim */
++  const coils = [];
++  const coilGeometry = new THREE.BoxGeometry(0.1, 0.42, 0.26);
++  for (let i = 0; i < 16; i += 1) {
++    const material = new THREE.MeshStandardMaterial({
++      color: 0x0e7490, emissive: 0x22d3ee, emissiveIntensity: 0.6,
++      metalness: 0.8, roughness: 0.35, transparent: true, opacity: 0.9,
++    });
++    const coil = new THREE.Mesh(coilGeometry, material);
++    const angle = (i / 16) * Math.PI * 2;
++    coil.position.set(Math.cos(angle) * 3.05, Math.sin(angle) * 3.05, 0);
++    coil.rotation.z = angle + Math.PI / 2;
++    coil.userData.phase = i * 0.4;
++    reactor.add(coil);
++    coils.push(coil);
++  }
+ 
+-  coreLight.color.copy(modeColor);
+-  coreLight.intensity = 2.6 + state.energy * 4.6 + breathe * 0.9 + level * 3.2;
+-  keyLight.intensity = 5.4 + state.energy * 3.4;
+-  ambient.intensity = 0.34 + state.energy * 0.22;
+-
+-  halo.material.opacity = 0.42 + state.energy * 0.4 + breathe * 0.06;
+-  const haloScale = 9.6 + state.energy * 3.4 + breathe * 0.5;
+-  halo.scale.set(haloScale, haloScale, 1);
+-
+-  // particles drift
+-  const pos = particleGeometry.attributes.position;
+-  if (!reducedMotion && frame % 2 === 0) {
+-    for (let i = 0; i < PARTICLES; i += 1) {
+-      const y = pos.array[i * 3 + 1];
+-      pos.array[i * 3 + 1] = y + Math.sin(t * 0.6 + seeds[i]) * 0.0016;
+-      const x = pos.array[i * 3];
+-      const z = pos.array[i * 3 + 2];
+-      const angle = 0.0009 + state.energy * 0.0016;
+-      pos.array[i * 3] = x * Math.cos(angle) - z * Math.sin(angle);
+-      pos.array[i * 3 + 2] = x * Math.sin(angle) + z * Math.cos(angle);
++  /* glowing plasma core */
++  const coreMaterial = new THREE.MeshStandardMaterial({
++    color: 0xe0fbff,
++    emissive: 0x22d3ee,
++    emissiveIntensity: 2.4,
++    metalness: 0.1,
++    roughness: 0.08,
++  });
++  core = new THREE.Mesh(new THREE.SphereGeometry(1.02, 48, 32), coreMaterial);
++  reactor.add(core);
++
++  const coreShell = new THREE.Mesh(
++    new THREE.SphereGeometry(1.42, 28, 18),
++    new THREE.MeshBasicMaterial({ color: 0x22d3ee, wireframe: true, transparent: true, opacity: 0.16 })
++  );
++  reactor.add(coreShell);
++
++  /* radial halo sprite (canvas gradient, no texture download needed) */
++  function haloTexture() {
++    const size = 256;
++    const cnv = document.createElement('canvas');
++    cnv.width = cnv.height = size;
++    const ctx = cnv.getContext('2d');
++    const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
++    gradient.addColorStop(0.0, 'rgba(224,251,255,0.95)');
++    gradient.addColorStop(0.28, 'rgba(34,211,238,0.45)');
++    gradient.addColorStop(0.62, 'rgba(37,99,235,0.14)');
++    gradient.addColorStop(1.0, 'rgba(0,0,0,0)');
++    ctx.fillStyle = gradient;
++    ctx.fillRect(0, 0, size, size);
++    const texture = new THREE.CanvasTexture(cnv);
++    if ('colorSpace' in texture) texture.colorSpace = THREE.SRGBColorSpace;
++    return texture;
++  }
++  const halo = new THREE.Sprite(new THREE.SpriteMaterial({
++    map: haloTexture(),
++    blending: THREE.AdditiveBlending,
++    depthWrite: false,
++    transparent: true,
++    opacity: 0.85,
++  }));
++  halo.scale.set(11, 11, 1);
++  scene.add(halo);
++
++  /* drifting particle field */
++  const PARTICLES = 520;
++  const positions = new Float32Array(PARTICLES * 3);
++  const seeds = new Float32Array(PARTICLES);
++  for (let i = 0; i < PARTICLES; i += 1) {
++    const radius = 4.6 + Math.random() * 9.5;
++    const angle = Math.random() * Math.PI * 2;
++    positions[i * 3] = Math.cos(angle) * radius;
++    positions[i * 3 + 1] = (Math.random() - 0.5) * 8.5;
++    positions[i * 3 + 2] = Math.sin(angle) * radius - 2;
++    seeds[i] = Math.random() * Math.PI * 2;
++  }
++  const particleGeometry = new THREE.BufferGeometry();
++  particleGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
++  const particles = new THREE.Points(particleGeometry, new THREE.PointsMaterial({
++    color: 0x7dd3fc, size: 0.055, sizeAttenuation: true,
++    transparent: true, opacity: 0.65, blending: THREE.AdditiveBlending, depthWrite: false,
++  }));
++  scene.add(particles);
++
++  /* ---- optional bloom (fails soft when the CDN path changes) ------------- */
++  async function initBloom() {
++    if (!renderer) { composer = null; return; }
++    try {
++      const [{ EffectComposer }, { RenderPass }, { UnrealBloomPass }, { OutputPass }] = await Promise.all([
++        import('three/addons/postprocessing/EffectComposer.js'),
++        import('three/addons/postprocessing/RenderPass.js'),
++        import('three/addons/postprocessing/UnrealBloomPass.js'),
++        import('three/addons/postprocessing/OutputPass.js'),
++      ]);
++      const next = new EffectComposer(renderer);
++      next.addPass(new RenderPass(scene, camera));
++      const bloom = new UnrealBloomPass(
++        new THREE.Vector2(window.innerWidth, window.innerHeight),
++        reducedMotion ? 0.35 : 0.72,   // strength
++        0.75,                          // radius
++        0.18                           // threshold
++      );
++      next.addPass(bloom);
++      next.addPass(new OutputPass());
++      composer = next;
++      composer.bloom = bloom;
++      log('sys', 'post-processing: unrealbloom online');
++    } catch (error) {
++      composer = null;
++      log('warn', `bloom pass unavailable (${error.message}) — rendering without post-fx`);
+     }
+-    pos.needsUpdate = true;
+   }
+ 
+-  // camera parallax
+-  pointer.x += (pointer.tx - pointer.x) * clamp(dt * 2.4, 0, 1);
+-  pointer.y += (pointer.ty - pointer.y) * clamp(dt * 2.4, 0, 1);
+-  camera.position.x = pointer.x * 1.15;
+-  camera.position.y = 0.9 - pointer.y * 0.85;
+-  camera.position.z = 9.4 - state.energy * 0.65;
+-  camera.lookAt(0, 0, 0);
++  /* ---- shared renderer colour state --------------------------------------- */
++  const modeColor = new THREE.Color(0x22d3ee);
++  wantedColor = new THREE.Color(0x22d3ee);
++
++  /* ---- pointer parallax --------------------------------------------------- */
++  const pointer = { x: 0, y: 0, tx: 0, ty: 0 };
++  window.addEventListener('pointermove', (event) => {
++    pointer.tx = (event.clientX / window.innerWidth - 0.5) * 2;
++    pointer.ty = (event.clientY / window.innerHeight - 0.5) * 2;
++  }, { passive: true });
++  window.addEventListener('blur', () => { pointer.tx = 0; pointer.ty = 0; });
++
++  /* ---- resize ------------------------------------------------------------- */
++  function resize() {
++    const width = Math.max(1, window.innerWidth);
++    const height = Math.max(1, window.innerHeight);
++    camera.aspect = width / height;
++    camera.updateProjectionMatrix();
++    if (renderer) renderer.setSize(width, height, false);
++    if (composer) composer.setSize(width, height);
++    const wave = $('waveform');
++    if (wave) {
++      wave.width = Math.floor(wave.clientWidth * Math.min(2, window.devicePixelRatio || 1));
++      wave.height = Math.floor(wave.clientHeight * Math.min(2, window.devicePixelRatio || 1));
++    }
++  }
++  window.addEventListener('resize', resize);
++  if (window.ResizeObserver) new ResizeObserver(resize).observe(document.body);
++
++  /* ---- the render loop ---------------------------------------------------- */
++  const clock = new THREE.Clock();
++  let frame = 0;
++
++  function tick() {
++    const dt = Math.min(0.05, clock.getDelta());
++    const t = clock.elapsedTime;
++    frame += 1;
++
++    // energy + colour ease toward the assistant state
++    state.energy += (state.targetEnergy - state.energy) * clamp(dt * 3.4, 0, 1);
++    modeColor.lerp(wantedColor, clamp(dt * 2.2, 0, 1));
++
++    const pulse = reducedMotion ? 0 : Math.sin(t * (2.6 + state.energy * 5.5));
++    const breathe = 0.5 + 0.5 * pulse;
++    const level = 0.35 + state.audioLevel * 0.9;             // live microphone gain
++
++    // continuous rotation: the signature idle spin, amplified while working
++    reactor.rotation.y += dt * (0.16 + state.energy * 0.75);
++    reactor.rotation.x = Math.sin(t * 0.22) * 0.14;
++    torus.rotation.z -= dt * (0.1 + state.energy * 0.35);
++    innerRing.rotation.z += dt * (0.5 + state.energy * 2.1);
++    outerRing.rotation.y -= dt * (0.25 + state.energy * 0.6);
++    coreShell.rotation.y -= dt * 0.55;
++    coreShell.rotation.x += dt * 0.2;
++
++    // core + material response
++    const glow = 1.6 + state.energy * 2.6 + breathe * 0.5 * (0.4 + state.energy) + level * 1.4;
++    coreMaterial.emissive.copy(modeColor);
++    coreMaterial.emissiveIntensity = glow;
++    core.scale.setScalar(1 + state.energy * 0.05 + breathe * 0.012 + level * 0.05);
++    torusMaterial.emissive.copy(modeColor).multiplyScalar(0.62);
++    torusMaterial.emissiveIntensity = 0.9 + state.energy * 1.5 + level;
++
++    coils.forEach((coil, i) => {
++      const local = Math.sin(t * (2.2 + state.energy * 3.2) + coil.userData.phase);
++      coil.material.emissiveIntensity = 0.35 + Math.max(0, local) * (0.8 + state.energy * 2.4);
++      coil.scale.z = 1 + Math.max(0, local) * 0.28 * (0.4 + state.energy);
++      coil.material.emissive.copy(modeColor);
++      if (i === 0) coil.visible = true;
++    });
+ 
+-  if (composer) composer.render(dt);
+-  else renderer.render(scene, camera);
++    coreLight.color.copy(modeColor);
++    coreLight.intensity = 2.6 + state.energy * 4.6 + breathe * 0.9 + level * 3.2;
++    keyLight.intensity = 5.4 + state.energy * 3.4;
++    ambient.intensity = 0.34 + state.energy * 0.22;
++
++    halo.material.opacity = 0.42 + state.energy * 0.4 + breathe * 0.06;
++    const haloScale = 9.6 + state.energy * 3.4 + breathe * 0.5;
++    halo.scale.set(haloScale, haloScale, 1);
++
++    // particles drift
++    const pos = particleGeometry.attributes.position;
++    if (!reducedMotion && frame % 2 === 0) {
++      for (let i = 0; i < PARTICLES; i += 1) {
++        const y = pos.array[i * 3 + 1];
++        pos.array[i * 3 + 1] = y + Math.sin(t * 0.6 + seeds[i]) * 0.0016;
++        const x = pos.array[i * 3];
++        const z = pos.array[i * 3 + 2];
++        const angle = 0.0009 + state.energy * 0.0016;
++        pos.array[i * 3] = x * Math.cos(angle) - z * Math.sin(angle);
++        pos.array[i * 3 + 2] = x * Math.sin(angle) + z * Math.cos(angle);
++      }
++      pos.needsUpdate = true;
++    }
++
++    // camera parallax
++    pointer.x += (pointer.tx - pointer.x) * clamp(dt * 2.4, 0, 1);
++    pointer.y += (pointer.ty - pointer.y) * clamp(dt * 2.4, 0, 1);
++    camera.position.x = pointer.x * 1.15;
++    camera.position.y = 0.9 - pointer.y * 0.85;
++    camera.position.z = 9.4 - state.energy * 0.65;
++    camera.lookAt(0, 0, 0);
++
++    if (composer) composer.render(dt);
++    else if (renderer) renderer.render(scene, camera);
++  }
++  if (renderer) renderer.setAnimationLoop(tick);
++  document.addEventListener('visibilitychange', () => {
++    if (document.hidden) { if (renderer) renderer.setAnimationLoop(null); }
++    else { clock.getDelta(); if (renderer) renderer.setAnimationLoop(tick); }
++  });
++  resize();
++  initBloom();
+ }
+-renderer.setAnimationLoop(tick);
+-document.addEventListener('visibilitychange', () => {
+-  if (document.hidden) renderer.setAnimationLoop(null);
+-  else { clock.getDelta(); renderer.setAnimationLoop(tick); }
+-});
+-resize();
+-initBloom();
+ 
+ /* ==========================================================================
+    2 · TERMINAL (WebSocket-fed log stream)
+@@ -1275,7 +1306,7 @@ function attachPlaybackAnalyser() {
+       gain.gain.value = 1;
+       playbackAnalyser.connect(gain);
+       gain.connect(audioCtx.destination);
+-      playbackAnalyser.connect(analyser || gain);
++      if (analyser) playbackAnalyser.connect(analyser);   // tap own voice for the waveform
+     }
+   } catch { /* already routed */ }
+ }
+diff --git a/static/bar.js b/static/bar.js
+index 48e83f4..86986ca 100644
+--- a/static/bar.js
++++ b/static/bar.js
+@@ -139,9 +139,11 @@ function escapeHtml(value) {
+ 
+ function formatAnswer(payload) {
+   const answer = String(payload.answer ?? payload.text ?? '').trim();
++  const error = String(payload.error ?? payload.message ?? '').trim();
+   const tools = Array.isArray(payload.tool_calls) ? payload.tool_calls.length : 0;
+   const bits = [];
+-  bits.push(answer ? escapeHtml(answer) : (payload.ok === false ? 'Failed.' : 'Done.'));
++  if (answer) bits.push(escapeHtml(answer));
++  else bits.push(error ? escapeHtml(error) : (payload.ok === false ? 'Failed.' : 'Done.'));
+   const tags = [];
+   if (payload.track) tags.push(payload.track);
+   if (tools) tags.push(`${tools} tool${tools === 1 ? '' : 's'}`);
+-- 
+2.39.5
+
