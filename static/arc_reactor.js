@@ -1113,6 +1113,8 @@ let chunks = [];
 let tapMode = false;
 let holdTimer = 0;
 let holding = false;
+let clipNode = null;        // ScriptProcessor capturing 16 kHz PCM for a mic clip
+let clipChunks = null;      // Float32Array[] at 16 kHz, accumulated while the mic is held
 let workletNode = null;
 let scriptNode = null;
 let streamSamples = null;   // float32 accumulation between flushes
@@ -1165,6 +1167,11 @@ async function startMic(toggle = false) {
 
   if (state.liveStream) { startLiveStream(); return; }
 
+  // Preferred: capture raw 16 kHz PCM so the core can transcribe it with NO ffmpeg.
+  // (ffmpeg is a separate manual install; the old MediaRecorder path silently produced
+  // webm/opus clips that decode to nothing on a machine without it.)
+  if (captureClip()) return;
+
   chunks = [];
   const mimeType = pickMimeType();
   try {
@@ -1178,6 +1185,66 @@ async function startMic(toggle = false) {
   recorder.start(250);
 }
 
+function captureClip() {
+  try {
+    const inputRate = audioCtx.sampleRate;
+    clipChunks = [];
+    clipNode = audioCtx.createScriptProcessor(1024, 1, 1);
+    clipNode.onaudioprocess = (event) => {
+      clipChunks.push(downsample(new Float32Array(event.inputBuffer.getChannelData(0)), inputRate, 16000));
+    };
+    // ScriptProcessor must be pulled; route it into a silent gain so it never feeds back.
+    const sink = audioCtx.createGain();
+    sink.gain.value = 0;
+    micSource.connect(clipNode);
+    clipNode.connect(sink);
+    sink.connect(audioCtx.destination);
+    return true;
+  } catch (error) {
+    log('warn', `PCM capture unavailable (${error.message}) — falling back to compressed clip`);
+    clipNode = null;
+    clipChunks = null;
+    return false;
+  }
+}
+
+function stopClipCapture() {
+  if (clipNode) {
+    try { micSource.disconnect(clipNode); clipNode.disconnect(); } catch { /* already gone */ }
+  }
+  clipNode = null;
+  if (!clipChunks || !clipChunks.length) { clipChunks = null; return null; }
+  const total = clipChunks.reduce((sum, part) => sum + part.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const part of clipChunks) { merged.set(part, offset); offset += part.length; }
+  clipChunks = null;
+  const pcm = new Int16Array(merged.length);
+  for (let i = 0; i < merged.length; i += 1) pcm[i] = clamp(merged[i], -1, 1) * 0x7fff | 0;
+  return pcm;
+}
+
+function sendClip(bytes, format, size, button) {
+  const kb = (size / 1024).toFixed(0);
+  if (send({ type: 'mic', format, data: base64FromBytes(bytes), size })) {
+    log('sys', `clip sent over ws · ${kb} kB · ${format}`);
+    button?.classList.remove('busy');
+  } else {
+    fetch(`${backendOrigin()}/api/listen`, {
+      method: 'POST',
+      headers: { 'content-type': `audio/${format}` },
+      body: bytes,
+    }).then(() => {
+      log('sys', `clip sent over http · ${kb} kB · ${format}`);
+      button?.classList.remove('busy');
+    }).catch((error) => {
+      log('err', `mic upload failed: ${error.message}`);
+      button?.classList.remove('busy');
+      setMode('idle');
+    });
+  }
+}
+
 function stopMic() {
   const button = $('btn-mic');
   clearTimeout(holdTimer);
@@ -1187,6 +1254,19 @@ function stopMic() {
   button?.classList.add('busy');
 
   if (state.liveStream) { stopLiveStream(); button?.classList.remove('busy'); setMode('thinking', 'closing stream'); return; }
+
+  if (clipNode) {
+    const pcm = stopClipCapture();
+    if (!pcm || pcm.length * 2 < 3200) {   // under ~0.1 s of 16 kHz mono
+      log('warn', 'clip too short — hold the mic button while speaking');
+      button?.classList.remove('busy');
+      setMode('idle');
+      return;
+    }
+    sendClip(pcm.buffer, 'pcm', pcm.length * 2, button);
+    return;
+  }
+
   if (!recorder || recorder.state === 'inactive') { button?.classList.remove('busy'); setMode('idle'); return; }
 
   recorder.onstop = async () => {

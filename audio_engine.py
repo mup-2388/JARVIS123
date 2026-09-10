@@ -104,6 +104,9 @@ def decode_to_wav(payload: bytes, src_ext: str = "webm") -> Tuple[Optional[Path]
     if not payload:
         return None, "empty audio payload"
     out = Path(tempfile.gettempdir()) / f"jarvis_in_{os.getpid()}_{threading.get_ident()}.wav"
+    if src_ext == "pcm":
+        # Raw 16 kHz s16 mono from the HUD/bar — no ffmpeg needed to wrap it.
+        return pcm16_to_wav(payload, TARGET_SR), ""
     if src_ext in {"wav"} and payload[:4] == b"RIFF":
         # Already PCM-ish; sniff-convert anyway so weird float formats normalise.
         pass

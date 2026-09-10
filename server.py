@@ -1477,6 +1477,25 @@ def create_app() -> FastAPI:
         ext = "wav" if "wav" in ctype else ("pcm" if "pcm" in ctype else "webm")
         return await _process_audio(body, ext, source="rest-mic")
 
+    def _stt_problem(transcript: Any) -> Optional[str]:
+        """Translate a silent/empty transcript into the *real* reason, when there is one.
+
+        ``transcribe_*`` returns an empty ``text`` for several very different reasons:
+        the mic was silent, or faster-whisper never loaded, or ffmpeg could not decode the
+        clip.  Reporting all of them as "no speech detected" is exactly why JARVIS appears
+        to ignore the user — the actual fault is hidden behind a red herring.
+        """
+        engine = str(getattr(transcript, "engine", "") or "")
+        if engine == "unavailable":
+            return "speech-to-text model is not loaded — faster-whisper is missing or failed to start (see the terminal)"
+        if engine == "missing-file":
+            return "the microphone audio file could not be read"
+        if engine.startswith("decode-error:"):
+            return f"could not decode the microphone audio: {engine[len('decode-error:'):]}"
+        if engine.startswith("error:"):
+            return f"speech-to-text failed: {engine[len('error:'):]}"
+        return None
+
     @app.post("/api/transcribe")
     async def post_transcribe(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:  # noqa: B008
         """``{"audio_base64": "...", "format": "wav", "speak": false, "command": true}``.
@@ -1500,10 +1519,13 @@ def create_app() -> FastAPI:
         ext = Path(ext).suffix.lstrip(".") if Path(ext).suffix else ext
         if ext not in {"wav", "webm", "ogg", "opus", "m4a", "mp3", "aac", "pcm"}:
             ext = "webm"
-        transcript = await asyncio.to_thread(voice.listen, raw, ext)
+        if ext == "pcm":
+            transcript = await asyncio.to_thread(voice.stt.transcribe_pcm, raw, TARGET_SR)
+        else:
+            transcript = await asyncio.to_thread(voice.listen, raw, ext)
         result: Dict[str, Any] = {"ok": bool(transcript.text), "transcript": transcript.as_dict()}
         if not transcript.text:
-            result["error"] = transcript.engine if transcript.engine.startswith(("decode-error", "error")) else "no speech detected"
+            result["error"] = _stt_problem(transcript) or "no speech detected"
             return result
         if command:
             result["reply"] = await handle_command(transcript.text, source="mic", speak=bool(speak))
@@ -1516,7 +1538,11 @@ def create_app() -> FastAPI:
             transcript = await asyncio.to_thread(voice.listen, body, ext)
         if not transcript.text:
             set_mode("idle")
-            return {"ok": False, "error": "no speech detected", "transcript": transcript.as_dict()}
+            problem = _stt_problem(transcript)
+            if problem:
+                TERMINAL.push("warn", problem)
+            return {"ok": False, "error": problem or "no speech detected",
+                    "transcript": transcript.as_dict()}
         HUB.emit({"type": "transcript", **transcript.as_dict()})
         reply = await handle_command(transcript.text, source=source, speak=SETTINGS.speak_replies)
         return {"ok": True, "transcript": transcript.as_dict(), "reply": reply}

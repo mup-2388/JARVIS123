@@ -35,7 +35,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import tools
 from config import SETTINGS, get_logger
-from llm_providers import LlmError, POOL, choose_tier, looks_like_research
+from llm_providers import LlmError, POOL, choose_tier, looks_like_research, strip_reasoning
 
 log = get_logger("router")
 
@@ -981,7 +981,8 @@ def _spoken_from_tools(tool_log: List[Dict[str, Any]]) -> str:
 
 
 def _clean_answer(text: str) -> str:
-    text = (text or "").strip()
+    text = strip_reasoning(text or "")
+    text = text.strip()
     text = re.sub(r"^(```[a-z]*\s*|\s*```$)", "", text).strip()
     text = re.sub(r"^(assistant|jarvis)\s*:\s*", "", text, flags=re.I)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)

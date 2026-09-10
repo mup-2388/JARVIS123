@@ -662,6 +662,76 @@ def _quota_text(body: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reasoning ("chain-of-thought") scrubber
+# ---------------------------------------------------------------------------
+#: Reasoning models wrap their inner monologue in tags so the assistant must
+#: never recite them.  Whitespace/newlines tolerated because some hubs break
+#: the tags across lines, and the names vary wildly between vendors.
+_THINK_OPEN = re.compile(
+    r"<\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>",
+    re.I,
+)
+_THINK_CLOSE = re.compile(
+    r"<\s*/\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>",
+    re.I,
+)
+_THINK_BLOCK = re.compile(
+    r"<\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>"
+    r".*?"
+    r"<\s*/\s*(?:think|thinking|reasoning|reason|thought|analysis|plan|scratchpad)\b[^>]*>",
+    re.I | re.S,
+)
+#: Special tokens that mark the end of the CoT on Qwen3/DeepSeek-style models.
+#: Everything before these is thinking; everything after is the answer.
+_ANSWER_MARKERS = ("<|endofthink|>", "<|end_of_think|>", "<|end_of_thought|>",
+                   "<|begin_of_answer|>", "<|im_start|>assistant", "<|assistant|>")
+#: Tokens that carry no answer themselves and are just removed.
+_NOISE_TOKENS = ("<|im_start|>", "<|im_end|>", "<|startofthink|>", "<|start_of_think|>",
+                 "<|begin_of_thought|>", "<|end_of_thought|>")
+
+
+def strip_reasoning(text: str) -> str:
+    """Return ``text`` with any model chain-of-thought removed.
+
+    Fixes the "JARVIS keeps answering with the thinking part" bug: reasoning
+    models (Qwen3, DeepSeek-R1, Groq's ``*maverick/scout``, …) sometimes emit
+    their inner monologue inline as ``<think>…</think>`` or behind a special
+    ``<|endofthink|>`` token.  We drop the blocks and keep only the answer.
+    """
+    if not text:
+        return ""
+    s = str(text)
+
+    # 1. Remove complete ``<think>…</think>`` blocks, contents included.
+    s = _THINK_BLOCK.sub("", s)
+
+    # 2. A leftover OPEN tag means the model was cut off mid-thought (e.g. it hit
+    #    max_tokens while reasoning): keep only what precedes it, never the CoT.
+    s = _THINK_OPEN.split(s, 1)[0]
+
+    # 3. Drop stray closing tags.
+    s = _THINK_CLOSE.sub("", s)
+
+    # 4. If a marker separated reasoning from the answer, keep the answer tail
+    #    (before step 5 strips the markers themselves).
+    best = -1
+    for marker in _ANSWER_MARKERS:
+        idx = s.rfind(marker)
+        if idx > best:
+            best = idx
+            best_len = len(marker)
+    if best >= 0:
+        s = s[best + best_len:]
+
+    # 5. Drop chat-template noise tokens that carry no answer.
+    for token in _NOISE_TOKENS:
+        s = s.replace(token, "")
+
+    # 6. Collapse whitespace runs left behind by the removals.
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# ---------------------------------------------------------------------------
 # The pool
 # ---------------------------------------------------------------------------
 
@@ -1111,8 +1181,9 @@ class LlmPool:
             choice = body["choices"][0] or {}
             message = choice.get("message") or {}
             content = str(message.get("content") or "")
-            if not content and isinstance(message.get("reasoning"), str):
-                content = message["reasoning"]
+            # ``reasoning`` / ``reasoning_content`` is the model's chain-of-thought,
+            # never the answer — reciting it is the "answers with the thinking part"
+            # bug, so it is deliberately ignored even when ``content`` is empty.
             calls = _native_tool_calls(message.get("tool_calls"))
             if not calls:
                 for tc in message.get("tool_calls") or []:      # openrouter/mistral variants
@@ -1124,7 +1195,7 @@ class LlmPool:
             raise ValueError(f"unrecognised response shape: {str(body)[:180]}")
         usage = body.get("usage") if isinstance(body, dict) else None
         return {
-            "content": content.strip(),
+            "content": strip_reasoning(content),
             "tool_calls": calls,
             "provider": spec.key,
             "model": model,

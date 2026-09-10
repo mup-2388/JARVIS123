@@ -35,5 +35,11 @@ TTS>=0.22.0
 # --- OS automation / telemetry ---------------------------------------------
 psutil>=5.9
 
+# --- Always-on ear (background wake-word listening) ------------------------
+# sounddevice streams the laptop mic into the energy gate in wake.py; numpy is
+# its dependency.  Without it the HUD mic button still works, but JARVIS can
+# only hear you while the HUD/bar has the mic open.
+sounddevice>=0.4.6
+
 # --- Discord bridge ---------------------------------------------------------
 discord.py>=2.4

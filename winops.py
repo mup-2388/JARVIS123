@@ -901,6 +901,30 @@ def screen_size() -> List[int]:
     return [int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))]
 
 
+def work_area() -> List[int]:
+    """The desktop rectangle *excluding* the taskbar: ``[x, y, width, height]``.
+
+    ``screen_size()`` reports the full primary monitor (taskbar included), so a
+    window positioned with it can end up under the taskbar or, on a DPI-scaled
+    laptop, entirely off-screen.  This is the geometry the floating bar should
+    actually be placed inside.
+    """
+    if not IS_WINDOWS or user32 is None:
+        return [0, 0, 0, 0]
+    try:
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        SPI_GETWORKAREA = 0x0030
+        if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            return [int(rect.left), int(rect.top), int(rect.right - rect.left),
+                    int(rect.bottom - rect.top)]
+    except Exception:  # noqa: BLE001 - any failure here just means "unknown geometry"
+        pass
+    size = screen_size()
+    return [0, 0, int(size[0]), int(size[1])]
+
+
 # ---------------------------------------------------------------------------- clipboard
 def clipboard_read() -> Dict[str, Any]:
     if not IS_WINDOWS:

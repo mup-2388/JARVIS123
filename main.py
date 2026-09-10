@@ -453,17 +453,26 @@ def print_context(port: int, report: Dict[str, Any], mode: str) -> None:
     print()
 
 
-def _bar_top() -> int:
-    """Y-position for the floating bar: bottom-left of the primary screen, above the taskbar."""
+def _bar_rect() -> Tuple[int, int, int, int]:
+    """``(x, y, width, height)`` for the floating bar, bottom-left of the *work area*.
+
+    Uses the taskbar-excluding work area (via ``winops.work_area()``) rather than the
+    raw screen size, and clamps to sane bounds so the bar can never be created off-screen
+    on a DPI-scaled laptop (the classic "F12 shows it in the taskbar but I can't see it" bug).
+    """
+    width = max(360, int(SETTINGS.bar_width))
+    height = max(64, int(SETTINGS.bar_height))
+    x, y = 48, 640
     try:
         import winops
 
-        size = winops.screen_size()
-        if len(size) > 1 and size[1]:
-            return max(0, int(size[1]) - SETTINGS.bar_height - 96)
+        area = winops.work_area()
+        if len(area) >= 4 and area[2] > 0 and area[3] > 0:
+            x = int(area[0]) + 48
+            y = max(int(area[1]), int(area[1]) + int(area[3]) - height - 96)
     except Exception:  # noqa: BLE001 - no display info is no reason to fail
         pass
-    return 640
+    return x, y, width, height
 
 
 def attach_loaded_handler(window: object, handler) -> str:  # noqa: ANN001
@@ -580,10 +589,11 @@ def launch(args: argparse.Namespace) -> int:
     bar = None
     if SETTINGS.bar_enabled:
         bar_url = f"http://127.0.0.1:{port}/bar"
+        bar_x, bar_y, bar_w, bar_h = _bar_rect()
         try:
             bar = webview.create_window(
-                "JARVIS bar", bar_url, width=max(360, SETTINGS.bar_width), height=max(64, SETTINGS.bar_height),
-                x=48, y=_bar_top(), easy_drag=True,
+                "JARVIS bar", bar_url, width=bar_w, height=bar_h,
+                x=bar_x, y=bar_y, easy_drag=True,
                 frameless=True, on_top=True, resizable=False, hidden=True, background_color="#05080e",
             )
         except TypeError:
@@ -610,18 +620,30 @@ def launch(args: argparse.Namespace) -> int:
                 bar.hide()
                 bar_controller.visible = False
             elif action == "toggle":
-                (bar.hide() if visible else bar.show())
-                bar_controller.visible = not visible
+                if visible:
+                    bar.hide()
+                    bar_controller.visible = False
+                else:
+                    bar.show()
+                    bar_controller.visible = True
+                    _place_overlay(bar)
             else:
                 bar.show()
                 bar_controller.visible = True
-                _style_overlay(bar)
+                _place_overlay(bar)
         except Exception as exc:  # noqa: BLE001 - a stuck overlay must not kill the app
             return {"ok": False, "visible": visible, "message": str(exc)}
         return {"ok": True, "visible": bool(bar_controller.visible)}
 
-    def _style_overlay(handle_owner: Any) -> None:
-        """Apply WS_EX_TOOLWINDOW | NOACTIVATE so the bar never steals focus or alt-tabs."""
+    def _place_overlay(handle_owner: Any) -> None:
+        """Pin the bar to the visible work area and style it as a no-focus overlay.
+
+        ``show()`` alone is not enough on a DPI-scaled laptop: pywebview hands the
+        coordinates to the OS in one scale and the OS interprets them in another, so the
+        window can land off-screen (present in the taskbar, invisible on the desktop).
+        Re-applying the geometry with the native HWND via ``winops.move_window`` pins it
+        to the real work area regardless of scaling.
+        """
         try:
             import winops
 
@@ -633,9 +655,10 @@ def launch(args: argparse.Namespace) -> int:
                     hwnd = int(value)
                     break
             if hwnd:
+                winops.move_window(hwnd, bar_x, bar_y, bar_w, bar_h)
                 winops.tool_window(hwnd, on_top=True, no_activate=True)
         except Exception as exc:  # noqa: BLE001
-            log.debug("overlay styling skipped: %s", exc)
+            log.debug("overlay placement skipped: %s", exc)
 
     bar_controller.visible = False
     config.BAR_CONTROLLER = bar_controller

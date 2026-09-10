@@ -351,6 +351,12 @@ class WakeListener:
         text = (getattr(transcript, "text", "") or "").strip()
         seconds = len(pcm) / 2 / SAMPLE_RATE
         if not text:
+            # "Nothing heard" and "the STT engine is broken" are different problems; only
+            # report the latter, or the HUD will keep saying "ready" while the ear is deaf.
+            engine = str(getattr(transcript, "engine", "") or "")
+            if engine in {"unavailable", "missing-file"} or engine.startswith(("decode-error", "error")):
+                self.state["reason"] = f"STT: {engine}"
+                self._publish()
             return
         with self._lock:
             self.state["heard"] = int(self.state.get("heard", 0)) + 1
